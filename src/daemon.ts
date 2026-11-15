@@ -9,9 +9,10 @@
 // learns the port.
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { writeFileSync, appendFileSync } from "node:fs";
+import { appendFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { WebSocketServer, WebSocket } from "ws";
 import { CdpRelay } from "./cdp-relay.js";
+import { CallStats } from "./stats.js";
 import { DAEMON_FILE, LOG_FILE, PORT, ensureHome, readOrCreateToken } from "./paths.js";
 import {
   EXTENSION_ID,
@@ -27,10 +28,24 @@ import { VERSION } from "./version.js";
 const EXTENSION_WAIT_MS = 20_000;
 const REQUEST_TIMEOUT_MS = 120_000;
 const IDLE_EXIT_MS = 30 * 60_000;
+/** Calls slower than this are written to the log (all calls are counted in the stats). */
+const SLOW_CALL_MS = 5_000;
+/** A thread whose MCP server and CDP clients are all gone this long gets its tabs released. */
+const RELEASE_AFTER_MS = Number(process.env.T3_BROWSER_RELEASE_AFTER_MS) || 120_000;
+const LOG_MAX_BYTES = 5 * 1024 * 1024;
+let linesSinceSizeCheck = 0;
 
 function log(...args: unknown[]): void {
   const line = `[${new Date().toISOString()}] ${args.map((a) => (typeof a === "string" ? a : JSON.stringify(a))).join(" ")}\n`;
   try {
+    if (++linesSinceSizeCheck >= 200) {
+      linesSinceSizeCheck = 0;
+      try {
+        if (statSync(LOG_FILE).size > LOG_MAX_BYTES) renameSync(LOG_FILE, `${LOG_FILE}.1`);
+      } catch {
+        // missing or locked log file: just keep appending
+      }
+    }
     appendFileSync(LOG_FILE, line);
   } catch {
     // logging must never take the daemon down
@@ -65,6 +80,15 @@ export class Daemon {
   private nextId = 1;
   private clients = new Set<WebSocket>();
   private relays = new Set<CdpRelay>();
+  readonly stats = new CallStats();
+  /**
+   * Which thread each MCP connection serves, to notice when a thread has gone away. CDP relay
+   * clients do not count: agent-browser keeps its relay socket open after the agent is gone.
+   */
+  private connectionSession = new Map<WebSocket, string>();
+  /** Threads that have used the user's browser and not released it yet. */
+  private activeSessions = new Map<string, SessionInfo>();
+  private releaseTimers = new Map<string, NodeJS.Timeout>();
   private idleTimer: NodeJS.Timeout | null = null;
   readonly token = readOrCreateToken();
 
@@ -164,6 +188,8 @@ export class Daemon {
         log("extension hello", this.extensionInfo);
         const waiters = this.extensionWaiters.splice(0);
         waiters.forEach((w) => w());
+        // Releases that could not reach Chrome earlier get another go.
+        for (const id of this.activeSessions.keys()) this.scheduleReleaseIfGone(id);
       } else if (msg.type === "response") {
         const p = this.pending.get(msg.id);
         if (p) {
@@ -212,6 +238,26 @@ export class Daemon {
 
   /** Forward one call to the extension. Used by /client connections and by CDP relays. */
   async call(session: SessionInfo, method: string, params?: Record<string, unknown>): Promise<ResponseMessage> {
+    if (method !== "session.release" && method !== "extension.reload") {
+      this.activeSessions.set(session.id, session);
+      // Activity restarts the grace period. With an MCP connection for the thread this is a
+      // no-op; relay-only activity (e.g. agent-browser cleaning up as it closes) re-arms it.
+      this.cancelRelease(session.id);
+      this.scheduleReleaseIfGone(session.id);
+    }
+    const started = Date.now();
+    const res = await this.forward(session, method, params);
+    const ms = Date.now() - started;
+    // Forget the thread only once Chrome confirmed the release; otherwise it is retried.
+    if (method === "session.release" && !res.error) this.activeSessions.delete(session.id);
+    this.stats.record(method, ms, !!res.error);
+    if (res.error) log("call failed", { method, ms, session: session.id, code: res.error.code, error: String(res.error.message ?? "").slice(0, 200) });
+    else if (ms > SLOW_CALL_MS) log("slow call", { method, ms });
+    else if (process.env.T3_BROWSER_DEBUG) log("call", { method, ms });
+    return res;
+  }
+
+  private async forward(session: SessionInfo, method: string, params?: Record<string, unknown>): Promise<ResponseMessage> {
     if (!(await this.waitForExtension())) {
       return {
         type: "response",
@@ -231,7 +277,6 @@ export class Daemon {
         this.pending.delete(id);
         // The extension bounds its own waits well below this, so reaching it means Chrome
         // itself stopped answering (or an old extension build is still loaded).
-        log(`request timed out after ${REQUEST_TIMEOUT_MS / 1000}s`, { method, session: session.id });
         resolve({ type: "response", id, error: { message: `Timed out waiting for Chrome (${method})`, code: "timeout" } });
       }, REQUEST_TIMEOUT_MS);
       this.pending.set(id, { resolve, timer });
@@ -253,7 +298,9 @@ export class Daemon {
         ws.send(JSON.stringify({ type: "pong" }));
         return;
       }
-      if (msg.type !== "request") return;
+      if (msg.type !== "request" || typeof msg.session?.id !== "string") return;
+      this.connectionSession.set(ws, msg.session.id);
+      this.cancelRelease(msg.session.id);
       if (msg.method === "daemon.status") {
         ws.send(
           JSON.stringify({
@@ -265,6 +312,7 @@ export class Daemon {
               extensionConnected: this.extension?.readyState === WebSocket.OPEN,
               extension: this.extensionInfo,
               cdpUrl: `ws://127.0.0.1:${this.port}/cdp/${encodeURIComponent(msg.session.id)}?token=${this.token}`,
+              stats: this.stats.summary(),
             },
           } satisfies ResponseMessage),
         );
@@ -275,6 +323,7 @@ export class Daemon {
     });
     ws.on("close", () => {
       this.clients.delete(ws);
+      this.connectionGone(ws);
       this.bumpIdle();
     });
   }
@@ -288,6 +337,39 @@ export class Daemon {
       relay.dispose();
       this.bumpIdle();
     });
+  }
+
+  // ---- Releasing a thread's tabs when the thread is gone ------------------------------------
+  // The MCP server exits when its agent session ends (or T3 Code restarts it). If nothing for
+  // that thread reconnects for a while, the agent is not coming back for its tabs: detach the
+  // debugger and overlay and leave the tabs in a collapsed group for the user.
+
+  private connectionGone(conn: WebSocket): void {
+    const id = this.connectionSession.get(conn);
+    this.connectionSession.delete(conn);
+    if (id) this.scheduleReleaseIfGone(id);
+  }
+
+  private scheduleReleaseIfGone(id: string): void {
+    if (!this.activeSessions.has(id) || this.releaseTimers.has(id) || [...this.connectionSession.values()].includes(id)) return;
+    const timer = setTimeout(() => void this.releaseGone(id).catch((e) => log("release failed", String(e))), RELEASE_AFTER_MS);
+    timer.unref();
+    this.releaseTimers.set(id, timer);
+  }
+
+  private cancelRelease(id: string): void {
+    const t = this.releaseTimers.get(id);
+    if (t) clearTimeout(t);
+    this.releaseTimers.delete(id);
+  }
+
+  private async releaseGone(id: string): Promise<void> {
+    this.releaseTimers.delete(id);
+    const session = this.activeSessions.get(id);
+    if (!session || [...this.connectionSession.values()].includes(id)) return;
+    if (this.extension?.readyState !== WebSocket.OPEN) return; // retried when Chrome says hello
+    const res = await this.call(session, "session.release", { closeTabs: false, keepGroup: true });
+    log("released the tabs of a thread that went away", { session: id, result: res.result, error: res.error?.message });
   }
 
   private bumpIdle(): void {

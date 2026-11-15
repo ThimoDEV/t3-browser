@@ -747,18 +747,32 @@ export const handlers: Record<string, (s: Session, p: Params) => Promise<unknown
     return { handled: dialog, accepted: !!p.accept };
   },
 
+  // browser_done: close the agent's tabs except keepTabIds, which leave the group.
+  // keepGroup (the thread ended without browser_done): keep every tab, in its group, collapsed,
+  // so the user still finds what the agent was doing, but with the debugger and overlay gone.
   async "session.release"(s, p) {
     const keep = new Set<number>((p.keepTabIds ?? []).map(Number));
-    const closeTabs = p.closeTabs !== false;
+    const keepGroup = p.keepGroup === true;
+    const closeTabs = !keepGroup && p.closeTabs !== false;
     for (const tabId of [...s.tabIds]) {
       await hideOverlay(tabId);
       await detach(tabId);
+      // The in-memory attach state is lost if the service worker restarted; detach anyway so
+      // tabs that stay open never keep Chrome's "debugging this browser" bar.
+      await chrome.debugger.detach({ tabId }).catch(() => {});
       forgetTab(tabId);
+      relayTabs.delete(tabId);
       if (closeTabs && !keep.has(tabId)) await chrome.tabs.remove(tabId).catch(() => {});
-      else await chrome.tabs.ungroup(tabId).catch(() => {});
+      else if (!keepGroup) await chrome.tabs.ungroup(tabId).catch(() => {});
+    }
+    const kept = keepGroup ? s.tabIds.length : closeTabs ? s.tabIds.filter((id) => keep.has(id)).length : s.tabIds.length;
+    if (keepGroup && s.groupId !== undefined) {
+      // Collapsing would pull the user off a tab they are looking at; leave the group open then.
+      const watched = await chrome.tabs.query({ groupId: s.groupId, active: true }).catch(() => []);
+      if (!watched.length) await chrome.tabGroups.update(s.groupId, { collapsed: true }).catch(() => {});
     }
     await dropSession(s.id);
-    return { released: true };
+    return { released: true, kept };
   },
 
   /** Load the build that is on disk now (used by `t3-browser reload-extension` after a rebuild). */

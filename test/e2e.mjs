@@ -8,7 +8,7 @@
 
 import assert from "node:assert/strict";
 import { spawn, execFile } from "node:child_process";
-import { cpSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -159,7 +159,43 @@ const env = {
   T3_BROWSER_SESSION_ID: "e2e-thread",
   T3_BROWSER_SESSION_TITLE: "E2E",
   AGENT_BROWSER_EXECUTABLE_PATH: exe,
+  // Threads that go away are released quickly in this test.
+  T3_BROWSER_RELEASE_AFTER_MS: "1500",
 };
+
+/** A stand-in for T3 Code's `t3` CLI: one thread, settled once the flag file exists. */
+const settledFlag = join(tmp, "thread-settled");
+function fakeT3Cli() {
+  const script = join(tmp, "fake-t3.mjs");
+  writeFileSync(
+    script,
+    `import { existsSync } from "node:fs";
+     process.stdout.write(JSON.stringify({ thread: { title: "Plan the team offsite", settled: existsSync(${JSON.stringify(settledFlag)}), archived: false } }));`,
+  );
+  if (process.platform === "win32") {
+    const cmd = join(tmp, "t3.cmd");
+    writeFileSync(cmd, `@"${process.execPath}" "${script}" %*\r\n`);
+    return cmd;
+  }
+  const sh = join(tmp, "t3");
+  writeFileSync(sh, `#!/bin/sh\nexec "${process.execPath}" "${script}" "$@"\n`);
+  chmodSync(sh, 0o755);
+  return sh;
+}
+
+/** Another agent thread: its own MCP server process, as T3 Code would start it. */
+async function startAgent(extraEnv) {
+  const t = new StdioClientTransport({ command: process.execPath, args: [join(root, "dist", "cli.js"), "mcp"], env: { ...env, ...extraEnv }, stderr: "inherit" });
+  const c = new Client({ name: "e2e-other", version: "0" });
+  await c.connect(t);
+  const run = async (name, args = {}) => {
+    const r = await c.callTool({ name, arguments: args });
+    const text = r.content.filter((x) => x.type === "text").map((x) => x.text).join("\n");
+    if (r.isError) throw new Error(text);
+    return JSON.parse(text);
+  };
+  return { call: run, close: () => c.close() };
+}
 const transport = new StdioClientTransport({ command: process.execPath, args: [join(root, "dist", "cli.js"), "mcp"], env, stderr: "inherit" });
 const mcp = new Client({ name: "e2e", version: "0" });
 await mcp.connect(transport);
@@ -434,6 +470,60 @@ await step("in a visible tab the cursor animates, and input still lands", async 
   // Each glide is capped well under a second; four actions must not crawl.
   assert.ok(elapsed < 8000, `four animated actions took ${elapsed}ms`);
   await call("browser_close_tab", { tab: t });
+});
+
+await step("the tab group is named after the T3 Code thread, and settling the thread hands the tabs back", async () => {
+  const agent = await startAgent({
+    T3_BROWSER_SESSION_ID: "e2e-thread-2",
+    T3CODE_THREAD_ID: "e2e-thread-2",
+    T3CODE_CLI_PATH: fakeT3Cli(),
+    T3_BROWSER_SESSION_TITLE: "",
+    T3_BROWSER_THREAD_POLL_MS: "300",
+  });
+  try {
+    const opened = await agent.call("browser_open", { url: `${site}/page2.html?thread=2` });
+    let status;
+    for (let i = 0; i < 25; i++) {
+      status = await agent.call("browser_status");
+      if (status.user.session.group?.title === "T3 · Plan the team offsite") break;
+      await sleep(200);
+    }
+    assert.equal(status.user.session.group.title, "T3 · Plan the team offsite");
+    const groupId = status.user.session.groupId;
+    assert.equal(await groupOf(opened.tab), groupId);
+
+    writeFileSync(settledFlag, "");
+    let after;
+    for (let i = 0; i < 30; i++) {
+      await sleep(200);
+      after = await agent.call("browser_status");
+      if (!after.user.tabs.length) break;
+    }
+    assert.deepEqual(after.user.tabs, [], "the settled thread no longer owns the tab");
+    assert.equal(await groupOf(opened.tab), groupId, "the tab stays open in its group");
+    const attached = await inExtension(`chrome.debugger.getTargets().then(ts => ts.find(t => t.tabId === ${opened.tab})?.attached)`);
+    assert.equal(attached, false, "the debugger is detached");
+    await inExtension(`chrome.tabs.remove(${opened.tab})`);
+  } finally {
+    await agent.close().catch(() => {});
+  }
+});
+
+await step("a thread whose agent goes away gets its tabs released", async () => {
+  const agent = await startAgent({ T3_BROWSER_SESSION_ID: "e2e-thread-3", T3_BROWSER_SESSION_TITLE: "Gone soon" });
+  const opened = await agent.call("browser_open", { url: `${site}/page2.html?thread=3` });
+  const groupId = await groupOf(opened.tab);
+  assert.ok(groupId >= 0);
+  assert.equal(await inExtension(`chrome.debugger.getTargets().then(ts => ts.find(t => t.tabId === ${opened.tab})?.attached)`), true);
+  await agent.close();
+  let attached = true;
+  for (let i = 0; i < 25 && attached; i++) {
+    await sleep(200);
+    attached = await inExtension(`chrome.debugger.getTargets().then(ts => ts.find(t => t.tabId === ${opened.tab})?.attached)`);
+  }
+  assert.equal(attached, false, "released after the grace period");
+  assert.equal(await groupOf(opened.tab), groupId, "the tab stays in its group for the user");
+  await inExtension(`chrome.tabs.remove(${opened.tab})`);
 });
 
 await step("browser_done keeps chosen tabs and closes the rest", async () => {

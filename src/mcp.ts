@@ -9,8 +9,9 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { IsolatedBrowser } from "./backends/isolated.js";
-import { BridgeClient } from "./client.js";
+import { BridgeClient, isDaemonRunning } from "./client.js";
 import type { TabInfo } from "./protocol.js";
+import { readThread } from "./t3thread.js";
 import { VERSION } from "./version.js";
 
 export const INSTRUCTIONS = `T3 Browser lets you use a web browser for the user.
@@ -25,7 +26,7 @@ Core loop:
 3. Act with the ref: browser_click / browser_type / browser_select / browser_press.
 4. Snapshot again before the next action. Refs go stale when the page changes; never guess a ref.
 Use browser_read for long text, and browser_screenshot only when layout or visuals matter.
-Call browser_name_session once with a short task name so the user can tell your tab group apart.
+The tab group is named after this T3 Code thread automatically. Use browser_name_session only if the user wants a different name (or there is no thread title).
 When finished, call browser_done (it keeps tabs the user should look at, closes the rest).
 
 Safety:
@@ -61,10 +62,58 @@ export function sessionFromEnv(): { id: string; title: string } {
   return { id, title };
 }
 
+/** How often to re-read the thread (title changes, settled/archived) while it uses the user's browser. */
+const THREAD_POLL_MS = Number(process.env.T3_BROWSER_THREAD_POLL_MS) || 60_000;
+
 export async function runMcp(): Promise<void> {
   const session = sessionFromEnv();
   const bridge = new BridgeClient(session);
   const isolated = new IsolatedBrowser(session.id);
+
+  // Name the tab group after the real T3 Code thread, not the project folder. The first call
+  // waits for this at most a moment; after that the title is refreshed in the background.
+  const cli = process.env.T3CODE_CLI_PATH ?? "";
+  const threadId = process.env.T3CODE_THREAD_ID ?? "";
+  const fromT3 = !!cli && !!threadId && threadId === session.id && !process.env.T3_BROWSER_SESSION_TITLE;
+  const refreshThread = async () => {
+    const info = fromT3 ? await readThread(cli, threadId) : undefined;
+    if (info?.title) session.title = info.title;
+    return info;
+  };
+  const titleReady = refreshThread().catch(() => undefined);
+  const firstTitle = Promise.race([titleReady, new Promise((r) => setTimeout(r, 1_500))]);
+
+  // Whether this thread may hold user-browser tabs to clean up when the thread ends. Set by any
+  // call that touches tabs, even a failed one, and even when an earlier MCP process opened them.
+  let holdsUserTabs = false;
+  const NO_TABS = new Set(["daemon.status", "status", "session.name", "tabs.list"]);
+  const callUser = async <T = unknown>(method: string, params?: Record<string, unknown>): Promise<T> => {
+    await firstTitle;
+    if (!NO_TABS.has(method) && method !== "session.release") holdsUserTabs = true;
+    const result = await bridge.call<T>(method, params);
+    if (method === "session.release") holdsUserTabs = false;
+    return result;
+  };
+  // Tell a running daemon this thread is back (e.g. after T3 Code restarted the agent), so it
+  // does not release tabs this thread is about to use again. Never starts a daemon.
+  void isDaemonRunning()
+    .then((up) => (up ? bridge.call("daemon.status") : undefined))
+    .catch(() => {});
+  // When the user settles or archives the thread, hand its tabs back: they stay open, in a
+  // collapsed group, with the debugger and overlay gone.
+  if (fromT3) {
+    setInterval(async () => {
+      if (!holdsUserTabs) return;
+      const info = await refreshThread().catch(() => undefined);
+      if (!info?.ended || !holdsUserTabs) return;
+      try {
+        await bridge.call("session.release", { closeTabs: false, keepGroup: true });
+        holdsUserTabs = false;
+      } catch {
+        // try again on the next poll
+      }
+    }, THREAD_POLL_MS).unref();
+  }
 
   const server = new McpServer({ name: "t3-browser", version: VERSION }, { instructions: INSTRUCTIONS });
 
@@ -94,7 +143,7 @@ export async function runMcp(): Promise<void> {
         const r = await isolated.open(url, headed);
         return json({ tab: `iso:${r.tab}`, browser: "isolated", url: r.url, title: r.title });
       }
-      return json(userTab(await bridge.call<TabInfo>("tabs.open", { url, active: !!focus })));
+      return json(userTab(await callUser<TabInfo>("tabs.open", { url, active: !!focus })));
     },
   );
 
@@ -103,7 +152,7 @@ export async function runMcp(): Promise<void> {
     "List tabs. scope='mine' (default): tabs this thread controls in both browsers. scope='all': every web tab the user has open in Chrome, to find one to claim.",
     { scope: z.enum(["mine", "all"]).optional() },
     async ({ scope }) => {
-      const user = (await bridge.call<TabInfo[]>("tabs.list", { scope: scope === "all" ? "all" : "session" })).map(userTab);
+      const user = (await callUser<TabInfo[]>("tabs.list", { scope: scope === "all" ? "all" : "session" })).map(userTab);
       const iso = scope === "all" ? [] : (await isolated.tabs()).map((t) => ({ tab: `iso:${t.id}`, browser: "isolated", url: t.url, title: t.title, active: t.active, mine: true }));
       return json([...user, ...iso]);
     },
@@ -113,7 +162,7 @@ export async function runMcp(): Promise<void> {
     "browser_claim_tab",
     "Take over a web tab the user already has open (from browser_tabs scope='all'). It moves into this thread's tab group.",
     { tab: z.number().describe("Chrome tab id") },
-    async ({ tab }) => json(userTab(await bridge.call<TabInfo>("tabs.claim", { tabId: tab }))),
+    async ({ tab }) => json(userTab(await callUser<TabInfo>("tabs.claim", { tabId: tab }))),
   );
 
   tool(
@@ -125,7 +174,7 @@ export async function runMcp(): Promise<void> {
       const a = action ?? "goto";
       if (a === "goto" && !url) throw new Error("Pass url (or an action).");
       if (t.kind === "isolated") return json(await isolated.navigate(t.tab, a, url));
-      return json(await bridge.call("tabs.navigate", { tabId: t.tabId, url, action: a }));
+      return json(await callUser("tabs.navigate", { tabId: t.tabId, url, action: a }));
     },
   );
 
@@ -144,7 +193,7 @@ export async function runMcp(): Promise<void> {
         const r = await isolated.snapshot(t.tab, { interactive, selector, maxDepth });
         return json(`Tab ${tab} (isolated) ${r.origin ?? ""}\n\n${r.snapshot}`);
       }
-      const r = await bridge.call<any>("page.snapshot", { tabId: t.tabId, interactive, selector, maxDepth });
+      const r = await callUser<any>("page.snapshot", { tabId: t.tabId, interactive, selector, maxDepth });
       const dialog = r.dialog ? `\n\n⚠ ${r.dialog.type} dialog open: ${JSON.stringify(r.dialog.message)} (use browser_dialog)` : "";
       return json(`Tab ${tab}: ${r.title} — ${r.url}\n\n${r.snapshot}${dialog}`);
     },
@@ -157,7 +206,7 @@ export async function runMcp(): Promise<void> {
     async ({ tab, ref, doubleClick, button }) => {
       const t = parseTab(tab);
       if (t.kind === "isolated") return json(await isolated.click(t.tab, ref, doubleClick));
-      return json(await bridge.call("page.click", { tabId: t.tabId, ref, doubleClick, button }));
+      return json(await callUser("page.click", { tabId: t.tabId, ref, doubleClick, button }));
     },
   );
 
@@ -168,7 +217,7 @@ export async function runMcp(): Promise<void> {
     async ({ tab, ref, text, clear, submit }) => {
       const t = parseTab(tab);
       if (t.kind === "isolated") return json(await isolated.type(t.tab, ref, text, clear !== false, !!submit));
-      return json(await bridge.call("page.type", { tabId: t.tabId, ref, text, clear, submit }));
+      return json(await callUser("page.type", { tabId: t.tabId, ref, text, clear, submit }));
     },
   );
 
@@ -179,7 +228,7 @@ export async function runMcp(): Promise<void> {
     async ({ tab, keys }) => {
       const t = parseTab(tab);
       if (t.kind === "isolated") return json(await isolated.press(t.tab, keys));
-      return json(await bridge.call("page.press", { tabId: t.tabId, keys }));
+      return json(await callUser("page.press", { tabId: t.tabId, keys }));
     },
   );
 
@@ -190,7 +239,7 @@ export async function runMcp(): Promise<void> {
     async ({ tab, direction, amount, ref }) => {
       const t = parseTab(tab);
       if (t.kind === "isolated") return json(await isolated.scroll(t.tab, direction, amount, ref));
-      return json(await bridge.call("page.scroll", { tabId: t.tabId, direction, amount, ref }));
+      return json(await callUser("page.scroll", { tabId: t.tabId, direction, amount, ref }));
     },
   );
 
@@ -201,14 +250,14 @@ export async function runMcp(): Promise<void> {
     async ({ tab, ref, values }) => {
       const t = parseTab(tab);
       if (t.kind === "isolated") return json(await isolated.select(t.tab, ref, values));
-      return json(await bridge.call("page.select", { tabId: t.tabId, ref, values }));
+      return json(await callUser("page.select", { tabId: t.tabId, ref, values }));
     },
   );
 
   tool("browser_hover", "Move the mouse over an element (menus, tooltips).", { tab: tabArg, ref: refArg }, async ({ tab, ref }) => {
     const t = parseTab(tab);
     if (t.kind === "isolated") return json(await isolated.hover(t.tab, ref));
-    return json(await bridge.call("page.hover", { tabId: t.tabId, ref }));
+    return json(await callUser("page.hover", { tabId: t.tabId, ref }));
   });
 
   tool(
@@ -220,7 +269,7 @@ export async function runMcp(): Promise<void> {
       const r =
         t.kind === "isolated"
           ? { ...(await isolated.screenshot(t.tab, fullPage)), url: "", title: "" }
-          : await bridge.call<{ data: string; mimeType: string; url: string; title: string }>("page.screenshot", { tabId: t.tabId, fullPage });
+          : await callUser<{ data: string; mimeType: string; url: string; title: string }>("page.screenshot", { tabId: t.tabId, fullPage });
       return {
         content: [
           { type: "image", data: r.data, mimeType: r.mimeType },
@@ -237,7 +286,7 @@ export async function runMcp(): Promise<void> {
     async ({ tab, selector, offset, maxChars }) => {
       const t = parseTab(tab);
       if (t.kind === "isolated") return json(await isolated.read(t.tab, selector, offset, maxChars));
-      return json(await bridge.call("page.read", { tabId: t.tabId, selector, offset, maxChars }));
+      return json(await callUser("page.read", { tabId: t.tabId, selector, offset, maxChars }));
     },
   );
 
@@ -248,7 +297,7 @@ export async function runMcp(): Promise<void> {
     async ({ tab, expression }) => {
       const t = parseTab(tab);
       if (t.kind === "isolated") return json(await isolated.eval(t.tab, expression));
-      return json(await bridge.call("page.eval", { tabId: t.tabId, expression }));
+      return json(await callUser("page.eval", { tabId: t.tabId, expression }));
     },
   );
 
@@ -267,7 +316,7 @@ export async function runMcp(): Promise<void> {
     async ({ tab, ...o }) => {
       const t = parseTab(tab);
       if (t.kind === "isolated") return json(await isolated.wait(t.tab, o));
-      return json(await bridge.call("page.wait", { tabId: t.tabId, ...o }));
+      return json(await callUser("page.wait", { tabId: t.tabId, ...o }));
     },
   );
 
@@ -278,7 +327,7 @@ export async function runMcp(): Promise<void> {
     async ({ tab, ref, files }) => {
       const t = parseTab(tab);
       if (t.kind === "isolated") return json(await isolated.upload(t.tab, ref, files));
-      return json(await bridge.call("page.upload", { tabId: t.tabId, ref, files }));
+      return json(await callUser("page.upload", { tabId: t.tabId, ref, files }));
     },
   );
 
@@ -289,7 +338,7 @@ export async function runMcp(): Promise<void> {
     async ({ tab, accept, promptText }) => {
       const t = parseTab(tab);
       if (t.kind === "isolated") return json(await isolated.dialog(t.tab, accept, promptText));
-      return json(await bridge.call("page.dialog", { tabId: t.tabId, accept, promptText }));
+      return json(await callUser("page.dialog", { tabId: t.tabId, accept, promptText }));
     },
   );
 
@@ -299,14 +348,14 @@ export async function runMcp(): Promise<void> {
       await isolated.closeTab(t.tab);
       return json({ closed: tab });
     }
-    return json(await bridge.call("tabs.close", { tabId: t.tabId }));
+    return json(await callUser("tabs.close", { tabId: t.tabId }));
   });
 
   tool(
     "browser_name_session",
-    "Name this thread's tab group so the user can tell what you are doing, e.g. 'Book dentist'. Call once before opening tabs.",
+    "Rename this thread's tab group, e.g. 'Book dentist'. Usually unnecessary: the group is named after the T3 Code thread. Once set, it no longer follows the thread title.",
     { title: z.string().max(60) },
-    async ({ title }) => json(await bridge.call("session.name", { title })),
+    async ({ title }) => json(await callUser("session.name", { title })),
   );
 
   tool(
@@ -315,7 +364,7 @@ export async function runMcp(): Promise<void> {
     { keepTabs: z.array(z.number()).optional(), closeTabs: z.boolean().optional() },
     async ({ keepTabs, closeTabs }) => {
       await isolated.close();
-      return json(await bridge.call("session.release", { keepTabIds: keepTabs ?? [], closeTabs }));
+      return json(await callUser("session.release", { keepTabIds: keepTabs ?? [], closeTabs }));
     },
   );
 
@@ -324,7 +373,7 @@ export async function runMcp(): Promise<void> {
     "Advanced: a Chrome DevTools Protocol URL for this thread's tab group in the user's browser. Run `agent-browser connect <url>` (or Playwright connectOverCDP) to use the full agent-browser command set on the user's real, signed-in tabs. Web pages only; Esc still hands control back.",
     {},
     async () => {
-      const status = await bridge.call<{ cdpUrl: string; extensionConnected: boolean }>("daemon.status");
+      const status = await callUser<{ cdpUrl: string; extensionConnected: boolean }>("daemon.status");
       return json({
         cdpUrl: status.cdpUrl,
         extensionConnected: status.extensionConnected,
@@ -335,9 +384,9 @@ export async function runMcp(): Promise<void> {
   );
 
   tool("browser_status", "Check the browser bridge: is the Chrome extension connected, and which tabs this thread has.", {}, async () => {
-    const daemon = await bridge.call<{ version: string; extensionConnected: boolean; extension: unknown }>("daemon.status");
+    const daemon = await callUser<{ version: string; extensionConnected: boolean; extension: unknown }>("daemon.status");
     const out: Record<string, unknown> = { session, bridge: { version: daemon.version, extensionConnected: daemon.extensionConnected, extension: daemon.extension } };
-    if (daemon.extensionConnected) out.user = await bridge.call("status");
+    if (daemon.extensionConnected) out.user = await callUser("status");
     out.isolated = await isolated.tabs().catch((e) => ({ error: String(e.message ?? e) }));
     return json(out);
   });

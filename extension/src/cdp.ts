@@ -57,8 +57,11 @@ export async function attach(tabId: number): Promise<void> {
       }
     }
     attached.add(tabId);
+    // Page events report dialogs and navigations. Runtime is not enabled: nothing here uses its
+    // events (evaluating code works without it), and enabling it streams every console message
+    // and execution context of the page to the extension. It was also a classic bot-detection
+    // signal in older Chrome versions. CDP clients on the relay may still enable it themselves.
     await send(tabId, "Page.enable").catch(() => {});
-    await send(tabId, "Runtime.enable").catch(() => {});
   })().finally(() => attaching.delete(tabId));
   attaching.set(tabId, p);
   return p;

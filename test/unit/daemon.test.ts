@@ -9,6 +9,7 @@ import WebSocket from "ws";
 const PORT = 48100 + Math.floor(Math.random() * 500);
 process.env.T3_BROWSER_HOME = mkdtempSync(join(tmpdir(), "t3b-unit-"));
 process.env.T3_BROWSER_PORT = String(PORT);
+process.env.T3_BROWSER_RELEASE_AFTER_MS = "300";
 
 const { Daemon } = await import("../../src/daemon");
 const { EXTENSION_ID } = await import("../../src/protocol");
@@ -21,6 +22,27 @@ function connect(path: string, headers: Record<string, string> = {}): Promise<We
     ws.once("open", () => resolve(ws));
     ws.once("error", reject);
     ws.once("unexpected-response", () => reject(new Error("rejected")));
+  });
+}
+
+/** The next message on ws that matches, or undefined after ms. */
+function waitFor(ws: WebSocket, match: (m: any) => boolean, ms = 2_000): Promise<any> {
+  return new Promise((resolve) => {
+    const onMessage = (raw: WebSocket.RawData) => {
+      const m = JSON.parse(raw.toString());
+      if (!match(m)) return;
+      cleanup();
+      resolve(m);
+    };
+    const timer = setTimeout(() => {
+      cleanup();
+      resolve(undefined);
+    }, ms);
+    const cleanup = () => {
+      clearTimeout(timer);
+      ws.off("message", onMessage);
+    };
+    ws.on("message", onMessage);
   });
 }
 
@@ -89,5 +111,121 @@ describe("routing", () => {
     ext.close();
     expect((await pending).error).toMatchObject({ code: "no_extension" });
     client.close();
+  });
+});
+
+describe("threads that go away", () => {
+  const releaseFor = (id: string) => (m: any) => m.type === "request" && m.method === "session.release" && m.session?.id === id;
+
+  async function fakeExtension() {
+    const ext = await connect("/extension", { origin: `chrome-extension://${EXTENSION_ID}` });
+    ext.send(JSON.stringify({ type: "hello", role: "extension", protocol: 1, version: "test" }));
+    // Answer every request so calls complete.
+    ext.on("message", (raw) => {
+      const m = JSON.parse(raw.toString());
+      if (m.type === "request") ext.send(JSON.stringify({ type: "response", id: m.id, result: { ok: true } }));
+    });
+    return ext;
+  }
+
+  async function request(ws: WebSocket, session: string, method: string, params: Record<string, unknown> = {}) {
+    const answered = next(ws);
+    ws.send(JSON.stringify({ type: "request", id: 1, session: { id: session, title: "T" }, method, params }));
+    return answered;
+  }
+
+  async function client(session: string, method = "tabs.open") {
+    const ws = await connect("/client", { authorization: `Bearer ${daemon.token}` });
+    await request(ws, session, method);
+    return ws;
+  }
+
+  it("releases a thread's tabs, keeping them in their group, once its MCP server is gone", async () => {
+    const ext = await fakeExtension();
+    const c = await client("gone-1");
+    const release = waitFor(ext, releaseFor("gone-1"));
+    c.close();
+    expect((await release)?.params).toEqual({ closeTabs: false, keepGroup: true });
+    ext.close();
+  });
+
+  it("does not release while another connection still serves the thread", async () => {
+    const ext = await fakeExtension();
+    const a = await client("gone-2");
+    const b = await client("gone-2", "daemon.status");
+    a.close();
+    expect(await waitFor(ext, releaseFor("gone-2"), 700)).toBeUndefined();
+    const release = waitFor(ext, releaseFor("gone-2"));
+    b.close();
+    expect(await release).toBeDefined();
+    ext.close();
+  });
+
+  it("does not release a thread that reconnects in time", async () => {
+    const ext = await fakeExtension();
+    (await client("gone-3")).close();
+    const back = await client("gone-3", "status");
+    expect(await waitFor(ext, releaseFor("gone-3"), 700)).toBeUndefined();
+    back.close();
+    expect(await waitFor(ext, releaseFor("gone-3"))).toBeDefined();
+    ext.close();
+  });
+
+  it("does not release again after the agent called browser_done", async () => {
+    const ext = await fakeExtension();
+    const c = await client("gone-4");
+    await request(c, "gone-4", "session.release", { keepTabIds: [] });
+    c.close();
+    expect(await waitFor(ext, (m) => releaseFor("gone-4")(m) && m.params?.keepGroup, 700)).toBeUndefined();
+    ext.close();
+  });
+
+  it("retries a release that could not reach Chrome once the extension is back", async () => {
+    const ext = await fakeExtension();
+    const c = await client("gone-5");
+    ext.close();
+    await new Promise((r) => setTimeout(r, 100));
+    c.close();
+    // The release timer fires while Chrome is away, so nothing can be released yet.
+    await new Promise((r) => setTimeout(r, 600));
+    const back = await fakeExtension();
+    expect(await waitFor(back, releaseFor("gone-5"))).toBeDefined();
+    back.close();
+  });
+
+  it("ignores CDP relay clients when deciding whether a thread is still there", async () => {
+    const ext = await fakeExtension();
+    const c = await client("gone-6");
+    const relay = await connect(`/cdp/gone-6?token=${daemon.token}`);
+    const release = waitFor(ext, releaseFor("gone-6"));
+    c.close();
+    expect(await release).toBeDefined();
+    relay.close();
+    ext.close();
+  });
+
+  it("still releases when a relay makes calls after the agent is gone", async () => {
+    const ext = await fakeExtension();
+    const c = await client("gone-7");
+    const relay = await connect(`/cdp/gone-7?token=${daemon.token}`);
+    c.close();
+    await new Promise((r) => setTimeout(r, 100));
+    // The relay keeps talking to Chrome after the agent is gone (Target.getTargets makes the
+    // daemon call tabs.list for the thread). That must not cancel the pending release.
+    const answered = next(relay);
+    relay.send(JSON.stringify({ id: 1, method: "Target.getTargets" }));
+    await answered;
+    expect(await waitFor(ext, releaseFor("gone-7"))).toBeDefined();
+    relay.close();
+    ext.close();
+  });
+
+  it("times every call into Chrome", async () => {
+    const ext = await fakeExtension();
+    const c = await client("timed", "page.snapshot");
+    const status = await request(c, "timed", "daemon.status");
+    expect(status.result.stats["page.snapshot"]).toMatchObject({ count: 1, errors: 0 });
+    c.close();
+    ext.close();
   });
 });

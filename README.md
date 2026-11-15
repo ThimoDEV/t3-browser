@@ -15,6 +15,7 @@ It works like the Codex Chrome extension, for every agent T3 Code runs (Claude C
 
 - **Your real Chrome, your sign-ins.** An agent works in its own tab group named after the thread, in the background, next to your own tabs. With the extension installed and connected, `browser_open` just opens the page in that group. There are no permission prompts at all.
 - **Web pages only.** Agents get http and https pages (localhost included). Browser pages (`chrome://`, `chrome-extension://`, `devtools://`), local files and the Chrome Web Store are refused.
+- **Groups follow the thread.** The tab group carries the T3 Code thread's real title (read through T3 Code's `t3` CLI). When you settle or archive the thread, or its agent goes away for two minutes, its tabs are handed back: they stay open in a collapsed group, with the debugger and overlay gone.
 - **You see what it does.** When you watch a controlled tab, the agent's own cursor (a purple arrow tagged "T3 Code") glides to each element and shows the click or "Typing…" before the real input is sent. In background tabs it skips the animation, so nothing slows down.
 - **You stay in charge.** Pressing **Esc** on a controlled tab, or clicking **Stop**, hands control straight back, and the agent is told to stop and ask you.
 - **Plus a clean browser.** For public pages and local dev servers, agents can use an isolated Chrome driven by Vercel's [agent-browser](https://github.com/vercel-labs/agent-browser). It has no cookies.
@@ -56,7 +57,7 @@ After pulling a new version, run `npm run reload`: it builds and tells the conne
 
 Start a **new** thread in T3 Code (MCP servers load when a session starts) and ask something like *"check my GitHub notifications and summarise the ones about t3code"*.
 
-`node dist/cli.js doctor` checks that the daemon is running and the extension is connected. `node dist/cli.js uninstall` removes the registrations.
+`node dist/cli.js doctor` checks that the daemon is running and the extension is connected, and shows how long each kind of call into Chrome has taken (count, p50, p95, max). Slow (over 5s) and failed calls are also written to `~/.t3-browser/daemon.log`. `node dist/cli.js uninstall` removes the registrations.
 
 ## What agents get
 
@@ -106,7 +107,7 @@ npm run test:e2e     # real Chrome for Testing + extension + daemon + MCP, end t
 
 The e2e suite runs the whole chain through an MCP client and fails if the extension ever opens a prompt window. It covers opening into the thread's tab group, claiming the user's tab, refusing non-web pages, Esc takeover, dialogs, iframes, covered elements, background-tab screenshots, new-tab adoption, the agent-browser CDP relay and the isolated browser.
 
-Environment: `T3_BROWSER_PORT` (default 47823, change the extension's port in its storage too), `T3_BROWSER_HOME` (default `~/.t3-browser`), `T3_BROWSER_SESSION_ID` / `T3_BROWSER_SESSION_TITLE` (default: `T3CODE_THREAD_ID` and the project folder name), `T3_BROWSER_DEBUG=1`.
+Environment: `T3_BROWSER_PORT` (default 47823, change the extension's port in its storage too), `T3_BROWSER_HOME` (default `~/.t3-browser`), `T3_BROWSER_SESSION_ID` / `T3_BROWSER_SESSION_TITLE` (default: `T3CODE_THREAD_ID`, and the thread's title from `T3CODE_CLI_PATH` or else the project folder name), `T3_BROWSER_RELEASE_AFTER_MS` (default 120000: how long a thread's agent may be gone before its tabs are released), `T3_BROWSER_THREAD_POLL_MS` (default 60000), `T3_BROWSER_DEBUG=1` (log every call).
 
 ## Limits
 

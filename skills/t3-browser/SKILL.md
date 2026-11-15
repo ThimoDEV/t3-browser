@@ -18,13 +18,13 @@ The user browser refuses anything that is not a web page: `chrome://` and other 
 
 ## Loop
 
-1. `browser_name_session({title})` once, with a short task name ("Book dentist").
+1. The tab group is named after this T3 Code thread automatically. Only call `browser_name_session({title})` if the user wants another name.
 2. `browser_open({url})`, or `browser_tabs({scope: "all"})` + `browser_claim_tab({tab})` to work in a tab the user already has open.
 3. `browser_snapshot({tab})` (add `interactive: true` for a shorter list). Lines look like `- button "Send" [ref=e6]`.
 4. Act with refs: `browser_click`, `browser_type` (`submit: true` presses Enter), `browser_select`, `browser_press`, `browser_scroll`, `browser_hover`, `browser_upload`.
 5. Snapshot again before the next action. Never reuse refs after the page changed; never guess one.
 6. `browser_read` for long text. `browser_screenshot` only when visuals matter or to show proof.
-7. `browser_done({keepTabs: [...]})` when finished: keeps the tabs the user should look at and closes the rest.
+7. `browser_done({keepTabs: [...]})` when finished: keeps the tabs the user should look at and closes the rest. (If the thread is settled or archived first, its tabs are handed back to the user automatically, left open in a collapsed group.)
 
 Errors carry a code in brackets:
 - `[covered]`: something (a cookie banner or modal) is on top. Dismiss it, re-snapshot, retry.

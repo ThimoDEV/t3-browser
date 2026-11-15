@@ -3,6 +3,7 @@ import { runDaemon } from "./daemon.js";
 import { extensionSteps, install, openExtensionsPage, uninstall } from "./install.js";
 import { runMcp, sessionFromEnv } from "./mcp.js";
 import { EXTENSION_DIR, LOG_FILE, PORT } from "./paths.js";
+import { formatSummary, type MethodSummary } from "./stats.js";
 import { VERSION } from "./version.js";
 
 const HELP = `t3-browser ${VERSION}: let T3 Code agents use your browser
@@ -81,7 +82,7 @@ async function main(argv: string[]): Promise<void> {
         return;
       }
       const client = new BridgeClient({ id: "doctor", title: "doctor" });
-      const s = await client.call<{ extensionConnected: boolean; extension: { version?: string } }>("daemon.status");
+      const s = await client.call<{ extensionConnected: boolean; extension: { version?: string }; stats?: Record<string, MethodSummary> }>("daemon.status");
       client.close();
       if (s.extensionConnected) console.log(`✓ Chrome extension connected (v${s.extension.version ?? "?"})`);
       else {
@@ -89,6 +90,9 @@ async function main(argv: string[]): Promise<void> {
         console.log(extensionSteps());
         process.exitCode = 1;
       }
+      if (s.stats) console.log(`
+Calls into Chrome since the daemon started:
+${formatSummary(s.stats)}`);
       return;
     }
     case undefined:
