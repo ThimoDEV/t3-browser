@@ -1,11 +1,13 @@
 // Connection from one agent thread (the MCP server process) to the shared daemon.
-// Starts the daemon on demand, the same way agent-browser starts its own.
+// Starts the local daemon on demand, the same way agent-browser starts its own; when this
+// machine is linked to the daemon on another machine (see remote.ts), it talks to that one.
 
 import { spawn } from "node:child_process";
 import { openSync } from "node:fs";
 import { WebSocket } from "ws";
-import { CLI_PATH, LOG_FILE, PORT, ensureHome, readOrCreateToken } from "./paths.js";
+import { CLI_PATH, LOG_FILE, ensureHome } from "./paths.js";
 import type { RequestMessage, ResponseMessage, SessionInfo } from "./protocol.js";
+import { bridgeEndpoint, wsBase, type Endpoint } from "./remote.js";
 
 export class BridgeError extends Error {
   constructor(
@@ -16,9 +18,9 @@ export class BridgeError extends Error {
   }
 }
 
-async function healthy(port: number): Promise<boolean> {
+async function healthy(base: string): Promise<boolean> {
   try {
-    const res = await fetch(`http://127.0.0.1:${port}/health`, { signal: AbortSignal.timeout(1500) });
+    const res = await fetch(`${base}/health`, { signal: AbortSignal.timeout(1500) });
     const body = (await res.json()) as { name?: string };
     return body.name === "t3-browser";
   } catch {
@@ -26,13 +28,20 @@ async function healthy(port: number): Promise<boolean> {
   }
 }
 
-/** True when a daemon answers on the port; never starts one. */
-export function isDaemonRunning(port = PORT): Promise<boolean> {
-  return healthy(port);
+/** True when the daemon this process would use answers; never starts one. */
+export function isDaemonRunning(endpoint: Endpoint = bridgeEndpoint()): Promise<boolean> {
+  return healthy(endpoint.base);
 }
 
-export async function ensureDaemon(port = PORT): Promise<void> {
-  if (await healthy(port)) return;
+export async function ensureDaemon(endpoint: Endpoint = bridgeEndpoint()): Promise<void> {
+  if (await healthy(endpoint.base)) return;
+  if (endpoint.remote) {
+    throw new BridgeError(
+      `Cannot reach the T3 Browser daemon at ${endpoint.base} (this machine is linked to the Chrome on another machine). ` +
+        "Ask the user to check that machine is on and reachable (Tailscale up, or the SSH tunnel open).",
+      "no_daemon",
+    );
+  }
   ensureHome();
   const out = openSync(LOG_FILE, "a");
   const child = spawn(process.execPath, [CLI_PATH, "daemon"], {
@@ -44,9 +53,9 @@ export async function ensureDaemon(port = PORT): Promise<void> {
   child.unref();
   for (let i = 0; i < 50; i++) {
     await new Promise((r) => setTimeout(r, 100));
-    if (await healthy(port)) return;
+    if (await healthy(endpoint.base)) return;
   }
-  throw new BridgeError(`Could not start the t3-browser daemon on port ${port}. See ${LOG_FILE}.`, "no_daemon");
+  throw new BridgeError(`Could not start the t3-browser daemon at ${endpoint.base}. See ${LOG_FILE}.`, "no_daemon");
 }
 
 export class BridgeClient {
@@ -57,17 +66,34 @@ export class BridgeClient {
 
   constructor(
     readonly session: SessionInfo,
-    private readonly port = PORT,
+    readonly endpoint: Endpoint = bridgeEndpoint(),
   ) {}
+
+  /** The daemon (and so Chrome) is on another machine. */
+  get remote(): boolean {
+    return this.endpoint.remote;
+  }
+
+  /** Rewrite a daemon-made ws://127.0.0.1:port/... URL to how this machine reaches the daemon. */
+  reachable(url: string): string {
+    const u = new URL(url);
+    const b = new URL(wsBase(this.endpoint.base));
+    u.protocol = b.protocol;
+    u.hostname = b.hostname;
+    u.port = b.port; // "" for the scheme's default port
+    return u.toString();
+  }
 
   private connect(): Promise<WebSocket> {
     if (this.ws?.readyState === WebSocket.OPEN) return Promise.resolve(this.ws);
     if (this.connecting) return this.connecting;
     this.connecting = (async () => {
-      await ensureDaemon(this.port);
-      const token = readOrCreateToken();
-      const ws = new WebSocket(`ws://127.0.0.1:${this.port}/client`, {
-        headers: { authorization: `Bearer ${token}` },
+      if (this.endpoint.remote && !this.endpoint.token) {
+        throw new BridgeError("T3_BROWSER_URL is set but T3_BROWSER_TOKEN is not. Run `t3-browser remote` on the machine with Chrome for both.", "no_token");
+      }
+      await ensureDaemon(this.endpoint);
+      const ws = new WebSocket(`${wsBase(this.endpoint.base)}/client`, {
+        headers: { authorization: `Bearer ${this.endpoint.token}` },
         maxPayload: 64 * 1024 * 1024,
       });
       await new Promise<void>((resolve, reject) => {

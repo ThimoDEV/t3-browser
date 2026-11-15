@@ -170,7 +170,7 @@ function fakeT3Cli() {
   writeFileSync(
     script,
     `import { existsSync } from "node:fs";
-     process.stdout.write(JSON.stringify({ thread: { title: "Plan the team offsite", settled: existsSync(${JSON.stringify(settledFlag)}), archived: false } }));`,
+     process.stdout.write(JSON.stringify({ thread: { title: "Plan the team offsite", link: "https://app.t3.codes/threads/e2e-offsite", settled: existsSync(${JSON.stringify(settledFlag)}), archived: false } }));`,
   );
   if (process.platform === "win32") {
     const cmd = join(tmp, "t3.cmd");
@@ -192,7 +192,11 @@ async function startAgent(extraEnv) {
     const r = await c.callTool({ name, arguments: args });
     const text = r.content.filter((x) => x.type === "text").map((x) => x.text).join("\n");
     if (r.isError) throw new Error(text);
-    return JSON.parse(text);
+    try {
+      return JSON.parse(text);
+    } catch {
+      return text; // snapshots are plain text
+    }
   };
   return { call: run, close: () => c.close() };
 }
@@ -489,6 +493,7 @@ await step("the tab group is named after the T3 Code thread, and settling the th
       await sleep(200);
     }
     assert.equal(status.user.session.group.title, "T3 · Plan the team offsite");
+    assert.equal(status.user.session.link, "https://app.t3.codes/threads/e2e-offsite", "the thread link reaches the extension");
     const groupId = status.user.session.groupId;
     assert.equal(await groupOf(opened.tab), groupId);
 
@@ -524,6 +529,132 @@ await step("a thread whose agent goes away gets its tabs released", async () => 
   assert.equal(attached, false, "released after the grace period");
   assert.equal(await groupOf(opened.tab), groupId, "the tab stays in its group for the user");
   await inExtension(`chrome.tabs.remove(${opened.tab})`);
+});
+
+const attachedTo = (tabId) => inExtension(`chrome.debugger.getTargets().then(ts => !!ts.find(t => t.tabId === ${tabId})?.attached)`);
+
+await step("an idle agent's tab drops the debugger (and Chrome's banner), and picks up where it left off", async () => {
+  await inExtension(`chrome.storage.local.get("settings").then(v => chrome.storage.local.set({ settings: { ...(v.settings || {}), idleDetachMs: 1500 } }))`);
+  try {
+    const r = await call("browser_open", { url: `${site}/form.html` });
+    const t = r.json.tab;
+    const s = (await call("browser_snapshot", { tab: t })).text;
+    assert.equal(await attachedTo(t), true);
+    let attached = true;
+    for (let i = 0; i < 40 && attached; i++) {
+      await sleep(200);
+      attached = await attachedTo(t);
+    }
+    assert.equal(attached, false, "detached after the idle time");
+    // Refs from before the detach still work: the next command reattaches.
+    await call("browser_type", { tab: t, ref: refOf(s, /textbox "Name"/), text: "After idle" });
+    assert.equal((await call("browser_eval", { tab: t, expression: "document.querySelector('[name=name]').value" })).json.value, "After idle");
+    assert.equal(await attachedTo(t), true);
+    await call("browser_close_tab", { tab: t });
+  } finally {
+    await inExtension(`chrome.storage.local.get("settings").then(v => chrome.storage.local.set({ settings: { ...(v.settings || {}), idleDetachMs: 60000 } }))`);
+  }
+});
+
+await step("while idle, the popup can still stop the thread, and a page that moved on never reuses old refs", async () => {
+  await inExtension(`chrome.storage.local.get("settings").then(v => chrome.storage.local.set({ settings: { ...(v.settings || {}), idleDetachMs: 1500 } }))`);
+  try {
+    const r = await call("browser_open", { url: `${site}/form.html` });
+    const t = r.json.tab;
+    const s = (await call("browser_snapshot", { tab: t })).text;
+    for (let i = 0; i < 40 && (await attachedTo(t)); i++) await sleep(200);
+    assert.equal(await attachedTo(t), false, "detached after the idle time");
+
+    // The popup: the thread is idle, not finished, so Stop must stay usable.
+    const { targetId } = await user.send("Target.createTarget", { url: "chrome-extension://doaacelnfjdbbfhhkglnkdgboeajnlhk/popup.html" });
+    // The page is still loading right after createTarget; evaluate once it has settled.
+    const evalWhenLoaded = async (id, expr) => {
+      for (let i = 0; ; i++) {
+        try {
+          return await user.evalIn(id, expr);
+        } catch (e) {
+          if (i >= 20 || !/context was destroyed|Cannot find context/.test(e.message)) throw e;
+          await sleep(100);
+        }
+      }
+    };
+    const rows = await evalWhenLoaded(
+      targetId,
+      `new Promise((r) => setTimeout(() => r([...document.querySelectorAll(".session")].map((x) => ({
+        title: x.querySelector("strong").textContent,
+        pill: x.querySelector(".pill").textContent,
+        stopDisabled: [...x.querySelectorAll("button")].find((b) => b.textContent === "Stop").disabled,
+      }))), 800))`,
+    );
+    await user.send("Target.closeTarget", { targetId });
+    const row = rows.find((x) => x.title === "Signup test");
+    assert.deepEqual(row, { title: "Signup test", pill: "idle", stopDisabled: false }, JSON.stringify(rows));
+
+    // The page moves on without the agent (a redirect, a refresh, the user clicking), here to
+    // another site: a new renderer process, whose node ids start over and can collide with old refs.
+    await inExtension(`chrome.tabs.update(${t}, { url: "${otherOrigin}/covered.html" })`);
+    for (let i = 0; i < 40; i++) {
+      const now = await inExtension(`chrome.tabs.get(${t}).then(x => x.status + " " + x.url)`);
+      if (now.startsWith("complete") && now.endsWith("localhost:" + fixtures.address().port + "/covered.html")) break;
+      await sleep(100);
+    }
+    // The old refs are forgotten as soon as the agent comes back, before anything is looked up
+    // in the new page (an id lookup could land on an unrelated element there).
+    await assert.rejects(call("browser_click", { tab: t, ref: refOf(s, /button "Send"/) }), /\[stale_ref\]: Unknown ref/);
+    assert.notEqual((await call("browser_eval", { tab: t, expression: "document.title" })).json.value, "clicked", "nothing on the new page was clicked");
+    await call("browser_close_tab", { tab: t });
+  } finally {
+    await inExtension(`chrome.storage.local.get("settings").then(v => chrome.storage.local.set({ settings: { ...(v.settings || {}), idleDetachMs: 60000 } }))`);
+  }
+});
+
+await step("the control page shows the thread's tabs, peeks at one, and stops the agent", async () => {
+  const token = readFileSync(join(tmp, "home", "token"), "utf8").trim();
+  const base = `http://127.0.0.1:${PORT}`;
+  const signIn = await fetch(`${base}/control?token=${token}`, { redirect: "manual" });
+  assert.equal(signIn.status, 302);
+  const cookie = signIn.headers.get("set-cookie").split(";")[0];
+  const state = await (await fetch(`${base}/control/state`, { headers: { cookie } })).json();
+  const thread = state.threads.find((x) => x.id === "e2e-thread");
+  assert.ok(thread?.tabs.some((x) => x.tabId === tab), JSON.stringify(state));
+  assert.ok(thread.activity.length > 0);
+
+  const post = (path, body) =>
+    fetch(`${base}${path}`, { method: "POST", headers: { cookie, "x-t3-browser": "1", "content-type": "application/json" }, body: JSON.stringify(body) }).then((x) => x.json());
+  const peek = await post("/control/peek", { session: "e2e-thread", tabId: tab });
+  assert.equal(peek.mimeType, "image/jpeg");
+  assert.ok(peek.data.length > 5000, "a real screenshot");
+  // Peeking must not swallow anything meant for the agent: its next call still works.
+  await call("browser_snapshot", { tab });
+
+  assert.deepEqual(await post("/control/stop", { session: "e2e-thread" }), { stopped: ["e2e-thread"] });
+  await assert.rejects(call("browser_snapshot", { tab }), /interrupted|took back control/);
+  await call("browser_snapshot", { tab });
+});
+
+await step("an agent on another machine uploads a file from its own disk", async () => {
+  const token = readFileSync(join(tmp, "home", "token"), "utf8").trim();
+  const agentHome = join(tmp, "agent-machine");
+  const file = join(tmp, "notes-from-the-vps.txt");
+  writeFileSync(file, "written on the agent machine");
+  const agent = await startAgent({
+    T3_BROWSER_SESSION_ID: "e2e-remote",
+    T3_BROWSER_SESSION_TITLE: "Remote agent",
+    T3_BROWSER_HOME: agentHome,
+    T3_BROWSER_URL: `ws://127.0.0.1:${PORT}`,
+    T3_BROWSER_TOKEN: token,
+  });
+  try {
+    const opened = await agent.call("browser_open", { url: `${site}/upload.html` });
+    const snap = await agent.call("browser_snapshot", { tab: opened.tab, interactive: true });
+    await agent.call("browser_upload", { tab: opened.tab, ref: refOf(snap, /Attachment/), files: [file] });
+    const out = await agent.call("browser_read", { tab: opened.tab, selector: "#out" });
+    assert.equal(out.text, "notes-from-the-vps.txt: written on the agent machine");
+    assert.ok(!existsSync(join(agentHome, "token")) || readFileSync(join(agentHome, "token"), "utf8").trim() !== token, "the agent used the linked token, not one of its own");
+    await agent.call("browser_done", {});
+  } finally {
+    await agent.close().catch(() => {});
+  }
 });
 
 await step("browser_done keeps chosen tabs and closes the rest", async () => {

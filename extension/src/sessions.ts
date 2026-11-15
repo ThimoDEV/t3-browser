@@ -15,6 +15,8 @@ export interface Session {
   title: string;
   /** Set by browser_name_session; from then on the default title from the MCP env is ignored. */
   named?: boolean;
+  /** The thread in T3 Code (web link), when the MCP server could read it. */
+  link?: string;
   groupId?: number;
   tabIds: number[];
   /** Set by Esc / Stop; reported to the agent once, then cleared. */
@@ -24,9 +26,12 @@ export interface Session {
 
 export interface Settings {
   port: number;
+  /** Detach the debugger from tabs the agent has not used for this long (ms), so Chrome's
+   * "started debugging this browser" bar goes away while the agent is idle. */
+  idleDetachMs: number;
 }
 
-export const DEFAULT_SETTINGS: Settings = { port: 47823 };
+export const DEFAULT_SETTINGS: Settings = { port: 47823, idleDetachMs: 60_000 };
 
 type GroupColor = "grey" | "blue" | "red" | "yellow" | "green" | "pink" | "purple" | "cyan" | "orange";
 const GROUP_COLORS: GroupColor[] = ["purple", "blue", "cyan", "green", "orange", "pink", "yellow", "red"];
@@ -58,14 +63,17 @@ async function save(): Promise<void> {
 export async function getSettings(): Promise<Settings> {
   const v = await chrome.storage.local.get("settings");
   const stored = (v.settings ?? {}) as Partial<Settings>;
-  return { port: typeof stored.port === "number" ? stored.port : DEFAULT_SETTINGS.port };
+  return {
+    port: typeof stored.port === "number" ? stored.port : DEFAULT_SETTINGS.port,
+    idleDetachMs: typeof stored.idleDetachMs === "number" && stored.idleDetachMs >= 1_000 ? stored.idleDetachMs : DEFAULT_SETTINGS.idleDetachMs,
+  };
 }
 
 export async function updateSettings(patch: Partial<Settings>): Promise<Settings> {
   // Only known keys are written, which also drops settings from older versions
   // (the site allow-list and "trusted" mode).
   const next: Settings = { ...(await getSettings()), ...patch };
-  await chrome.storage.local.set({ settings: { port: next.port } });
+  await chrome.storage.local.set({ settings: { port: next.port, idleDetachMs: next.idleDetachMs } });
   return next;
 }
 
@@ -83,6 +91,10 @@ export async function getSession(info: SessionInfo): Promise<Session> {
     await save();
   } else if (!s.named && info.title && info.title !== info.id && info.title !== s.title) {
     await renameSession(s, info.title);
+  }
+  if (info.link && info.link !== s.link && isWebUrl(info.link)) {
+    s.link = info.link;
+    await save();
   }
   return s;
 }

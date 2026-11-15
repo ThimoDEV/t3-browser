@@ -3,6 +3,7 @@
 //   - "isolated": a clean Chrome driven by agent-browser (no cookies)
 // Tabs from the isolated browser are prefixed "iso:" so every tool can route by tab id.
 
+import { readFileSync, statSync } from "node:fs";
 import { basename } from "node:path";
 import { randomUUID } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -10,7 +11,8 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { IsolatedBrowser } from "./backends/isolated.js";
 import { BridgeClient, isDaemonRunning } from "./client.js";
-import type { TabInfo } from "./protocol.js";
+import type { SessionInfo, TabInfo } from "./protocol.js";
+import { MAX_INLINE_UPLOAD_BYTES } from "./remote.js";
 import { readThread } from "./t3thread.js";
 import { VERSION } from "./version.js";
 
@@ -56,7 +58,7 @@ function parseTab(tab: string | number): { kind: "user"; tabId: number } | { kin
   return { kind: "user", tabId: n };
 }
 
-export function sessionFromEnv(): { id: string; title: string } {
+export function sessionFromEnv(): SessionInfo {
   const id = process.env.T3_BROWSER_SESSION_ID || process.env.T3CODE_THREAD_ID || process.env.CLAUDE_CODE_SESSION_ID || process.env.CODEX_THREAD_ID || randomUUID();
   const title = process.env.T3_BROWSER_SESSION_TITLE || basename(process.cwd()) || "Agent";
   return { id, title };
@@ -78,6 +80,7 @@ export async function runMcp(): Promise<void> {
   const refreshThread = async () => {
     const info = fromT3 ? await readThread(cli, threadId) : undefined;
     if (info?.title) session.title = info.title;
+    if (info?.link) session.link = info.link;
     return info;
   };
   const titleReady = refreshThread().catch(() => undefined);
@@ -327,7 +330,13 @@ export async function runMcp(): Promise<void> {
     async ({ tab, ref, files }) => {
       const t = parseTab(tab);
       if (t.kind === "isolated") return json(await isolated.upload(t.tab, ref, files));
-      return json(await callUser("page.upload", { tabId: t.tabId, ref, files }));
+      if (!bridge.remote) return json(await callUser("page.upload", { tabId: t.tabId, ref, files }));
+      // Chrome is on another machine: these paths mean nothing there, so send the contents.
+      const total = files.reduce((n, f) => n + statSync(f).size, 0);
+      if (total > MAX_INLINE_UPLOAD_BYTES) throw new Error(`Uploading to a browser on another machine is limited to ${MAX_INLINE_UPLOAD_BYTES / 1024 / 1024}MB in total.`);
+      const inlineFiles = files.map((f) => ({ name: basename(f), data: readFileSync(f).toString("base64") }));
+      const r = await callUser<Record<string, unknown>>("page.upload", { tabId: t.tabId, ref, inlineFiles });
+      return json({ ...r, uploaded: files });
     },
   );
 
@@ -375,9 +384,9 @@ export async function runMcp(): Promise<void> {
     async () => {
       const status = await callUser<{ cdpUrl: string; extensionConnected: boolean }>("daemon.status");
       return json({
-        cdpUrl: status.cdpUrl,
+        cdpUrl: bridge.reachable(status.cdpUrl),
         extensionConnected: status.extensionConnected,
-        usage: `agent-browser --session t3-user connect "${status.cdpUrl}" && agent-browser --session t3-user snapshot -i`,
+        usage: `agent-browser --session t3-user connect "${bridge.reachable(status.cdpUrl)}" && agent-browser --session t3-user snapshot -i`,
         note: "The URL contains a local secret. Do not share it or paste it into web pages.",
       });
     },

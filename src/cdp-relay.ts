@@ -54,6 +54,7 @@ export class CdpRelay {
       } catch {
         return;
       }
+      if (!msg || typeof msg !== "object") return;
       this.handle(msg).catch((err) => this.reply(msg, undefined, String(err?.message ?? err)));
     });
   }

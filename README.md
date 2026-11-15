@@ -10,12 +10,15 @@ Let [T3 Code](https://github.com/pingdotgg/t3code) agents use your browser.
 - **A visible agent cursor.** In a tab you're watching, a purple "T3 Code" cursor glides to each element and shows the click or "Typing…" before the real input is sent.
 - **No silent hangs.** Opening a tab can no longer wait on an unseen prompt until the bridge times out.
 - **Self-updating extension.** `npm run reload` builds and makes the connected Chrome load the new extension, no trip to `chrome://extensions`.
+- **Agents on other machines.** An agent on a VPS or a linked T3 Code environment can use the Chrome on your desk, over Tailscale or an SSH tunnel. See [Use it from another machine](#use-it-from-another-machine).
+- **A control page for your phone.** What each thread is doing in Chrome, a peek at its tabs, and Stop. See [Control page](#control-page).
+- **Quiet when idle.** Chrome's "started debugging this browser" bar goes away once an agent has been idle for a minute, and comes back when it acts again.
 
 It works like the Codex Chrome extension, for every agent T3 Code runs (Claude Code, Codex, Cursor):
 
 - **Your real Chrome, your sign-ins.** An agent works in its own tab group named after the thread, in the background, next to your own tabs. With the extension installed and connected, `browser_open` just opens the page in that group. There are no permission prompts at all.
 - **Web pages only.** Agents get http and https pages (localhost included). Browser pages (`chrome://`, `chrome-extension://`, `devtools://`), local files and the Chrome Web Store are refused.
-- **Groups follow the thread.** The tab group carries the T3 Code thread's real title (read through T3 Code's `t3` CLI). When you settle or archive the thread, or its agent goes away for two minutes, its tabs are handed back: they stay open in a collapsed group, with the debugger and overlay gone.
+- **Groups follow the thread.** The tab group carries the T3 Code thread's real title (read through T3 Code's `t3` CLI). When you settle or archive the thread, or its agent goes away for two minutes, its tabs are handed back: they stay open in a collapsed group, with the debugger and overlay gone. The extension popup and the "T3 Code is using this tab" pill on the page link straight to the thread.
 - **You see what it does.** When you watch a controlled tab, the agent's own cursor (a purple arrow tagged "T3 Code") glides to each element and shows the click or "Typing…" before the real input is sent. In background tabs it skips the animation, so nothing slows down.
 - **You stay in charge.** Pressing **Esc** on a controlled tab, or clicking **Stop**, hands control straight back, and the agent is told to stop and ask you.
 - **Plus a clean browser.** For public pages and local dev servers, agents can use an isolated Chrome driven by Vercel's [agent-browser](https://github.com/vercel-labs/agent-browser). It has no cookies.
@@ -59,6 +62,38 @@ Start a **new** thread in T3 Code (MCP servers load when a session starts) and a
 
 `node dist/cli.js doctor` checks that the daemon is running and the extension is connected, and shows how long each kind of call into Chrome has taken (count, p50, p95, max). Slow (over 5s) and failed calls are also written to `~/.t3-browser/daemon.log`. `node dist/cli.js uninstall` removes the registrations.
 
+## Control page
+
+`node dist/cli.js control` prints a link (it carries the daemon's token once, then a cookie takes over). The page lists every thread that used Chrome since the daemon started: its tabs, its recent actions ("opened https://…", "typed 12 characters", never the text itself or URL query strings), a **Peek** button that screenshots a tab, and **Stop** (per thread, or all). Stop works like pressing Esc: the agent is told to stop and ask you.
+
+To open it on your phone, let the daemon listen on your Tailscale address (next section) and open the printed `http://100.x.y.z:47823/control?token=…` link on the phone.
+
+## Use it from another machine
+
+When T3 Code runs an agent somewhere else (a VPS, a linked environment), that agent can still use the Chrome on your desk. The daemon stays next to Chrome; the agent machine is linked to it with the daemon's address and token.
+
+On the machine with Chrome:
+
+```sh
+node dist/cli.js remote --listen 100.x.y.z   # your Tailscale IP (`tailscale ip -4`); prints the command for the agent machine
+```
+
+On the agent machine (with t3-browser installed there too):
+
+```sh
+node dist/cli.js remote-link ws://100.x.y.z:47823   # asks for the token; then start a new thread
+```
+
+Without Tailscale, use an SSH tunnel and keep the daemon on loopback: `ssh -N -R 47823:127.0.0.1:47823 you@agent-machine` from the Chrome machine, then `remote-link ws://127.0.0.1:47823` on the agent machine. `remote-link --off` and `remote --no-listen` undo it.
+
+What changes for a linked agent: nothing in how it works. Its tab group, Esc, Stop and the control page behave the same. Files it uploads are sent from its machine and written to a private, short-lived folder next to Chrome (40MB total per upload). The isolated browser still runs on the agent's own machine.
+
+The daemon only listens on specific private addresses (loopback, LAN, Tailscale's 100.64.0.0/10, IPv6 unique-local), never on `0.0.0.0` or a public IP, and the extension endpoint only accepts Chrome on the same machine. The token is the key to your browser, and to files on the Chrome machine (an agent can ask Chrome to upload any local path): Tailscale (encrypted) or SSH are the recommended routes, and on a shared LAN anyone sniffing plain traffic could read it. `remote-link` asks for the token rather than taking it as an argument, so it stays out of shell history.
+
+With an SSH tunnel, every connection reaches the daemon as if from this machine, so processes on the agent machine could try to pose as the extension. The daemon only accepts a second extension connection when the current one has stopped answering, so this can only happen while Chrome is closed or the extension is off.
+
+The daemon keeps running while remote use is set up (a remote agent cannot start it), and retries a listen address that was not available yet, such as Tailscale coming up after boot.
+
 ## What agents get
 
 | Tool | Does |
@@ -77,7 +112,7 @@ The server also sends usage and safety instructions in its MCP `initialize` resp
 
 ## Security model
 
-- The daemon binds `127.0.0.1` only.
+- The daemon binds `127.0.0.1`, plus private addresses you add with `remote --listen` (never a wildcard or public address). The extension endpoint accepts loopback connections only.
 - The browser side accepts exactly one Origin: `chrome-extension://doaacelnfjdbbfhhkglnkdgboeajnlhk`. The ID is pinned by the public key in the manifest, and web pages cannot forge that Origin.
 - Local clients (the MCP server, CDP clients) need the random token in `~/.t3-browser/token`, and any connection that carries a web Origin is refused even if it has the token. A page that finds the port still can't drive the browser.
 - The extension only works on web pages (http/https). It refuses browser-internal pages, extension pages, local files and the Web Store, for opening, navigating, acting and claiming alike. It never asks for permission: opening sites, listing your web tabs, taking one over and uploads just happen, and you watch (and stop) it in the tab itself. The agent instructions say to upload only files you asked for.

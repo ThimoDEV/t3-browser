@@ -12,7 +12,8 @@ interface Point {
 interface OverlayApi {
   /** Build that injected this overlay. */
   build?: string;
-  show(label: string): void;
+  /** `hasLink`: the label opens the thread in T3 Code. */
+  show(label: string, hasLink?: boolean): void;
   hide(): void;
   /** Glide the agent cursor to (x, y), starting from `from` (or the control pill). Resolves on arrival. */
   moveTo(x: number, y: number, from: Point | null, activity: string | null): Promise<void>;
@@ -78,6 +79,8 @@ declare const __BUILD_ID__: string;
       kbd { font: 600 11px/1 ui-monospace, monospace; background: rgba(255,255,255,.12); border-radius: 4px; padding: 3px 5px; }
       button { all: unset; cursor: pointer; color: #c4b5fd; font-weight: 600; }
       button:hover { color: #fff; }
+      .label.link { cursor: pointer; text-decoration: underline; text-decoration-color: rgba(196,181,253,.5); text-underline-offset: 3px; }
+      .label.link:hover { color: #fff; }
 
       /* The agent's cursor. Its tip sits exactly on the point the agent acts on. */
       .cursor {
@@ -135,6 +138,9 @@ declare const __BUILD_ID__: string;
   };
 
   stop.addEventListener("click", () => interrupt("stop-button"));
+  label.addEventListener("click", () => {
+    if (label.classList.contains("link")) chrome.runtime.sendMessage({ kind: "open-thread" }).catch(() => {});
+  });
   window.addEventListener(
     "keydown",
     (e) => {
@@ -183,8 +189,10 @@ declare const __BUILD_ID__: string;
 
   window.__t3BrowserOverlay = {
     build: BUILD,
-    show(text: string) {
+    show(text: string, hasLink?: boolean) {
       label.textContent = text;
+      label.classList.toggle("link", !!hasLink);
+      label.title = hasLink ? "Open this thread in T3 Code" : "";
       visible = true;
       frame.classList.remove("hidden");
       pill.classList.remove("hidden");

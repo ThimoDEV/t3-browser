@@ -7,6 +7,8 @@ import { spawn } from "node:child_process";
 
 export interface ThreadInfo {
   title?: string;
+  /** The thread in T3 Code (web link). */
+  link?: string;
   /** The user settled or archived the thread: its agent is done with the browser. */
   ended: boolean;
 }
@@ -23,7 +25,8 @@ export function parseThreadJson(text: string): ThreadInfo | undefined {
   const title = typeof thread.title === "string" && thread.title.trim() ? thread.title.trim() : undefined;
   // A thread with a run in progress is still using the browser, whatever its flags say.
   const running = !!thread.activeRunId;
-  return { title, ended: !running && (thread.archived === true || thread.settled === true) };
+  const link = typeof thread.link === "string" && /^https?:\/\//.test(thread.link) ? thread.link : undefined;
+  return { title, ...(link ? { link } : {}), ended: !running && (thread.archived === true || thread.settled === true) };
 }
 
 /** Thread ids come from T3 Code's environment; anything else is not passed to a shell. */

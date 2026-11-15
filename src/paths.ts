@@ -9,6 +9,10 @@ export const HOME = process.env.T3_BROWSER_HOME ?? join(homedir(), ".t3-browser"
 export const TOKEN_FILE = join(HOME, "token");
 export const DAEMON_FILE = join(HOME, "daemon.json");
 export const LOG_FILE = join(HOME, "daemon.log");
+/** On an agent machine: which remote daemon to use (written by `t3-browser remote-link`). */
+export const REMOTE_FILE = join(HOME, "remote.json");
+/** On the Chrome machine: extra addresses the daemon listens on (written by `t3-browser remote --listen`). */
+export const CONFIG_FILE = join(HOME, "config.json");
 
 export const PORT = Number(process.env.T3_BROWSER_PORT ?? DEFAULT_PORT);
 

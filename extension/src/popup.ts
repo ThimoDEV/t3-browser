@@ -31,7 +31,10 @@ async function render() {
   const list = $("#sessions");
   list.replaceChildren();
   for (const s of state.sessions) {
-    const live = s.tabs.some((t) => t.controlled);
+    // The thread holds tabs and has not been stopped: Stop must work, even while the debugger is
+    // detached because the agent is idle.
+    const live = s.tabs.length > 0 && !s.interrupted;
+    const acting = s.tabs.some((t) => t.controlled);
     const tabs = el("ul", { class: "tabs" });
     for (const t of s.tabs) {
       const item = el("li", { title: t.url ?? "" }, t.title || t.url || `Tab ${t.tabId}`);
@@ -39,19 +42,22 @@ async function render() {
       tabs.append(item);
     }
     const stop = el("button", { class: "ghost small" }, "Stop");
+    const open = el("button", { class: "ghost small", title: "Open this thread in T3 Code" }, "Thread");
+    open.addEventListener("click", () => s.link && chrome.tabs.create({ url: s.link }));
+    if (!s.link) open.hidden = true;
     stop.addEventListener("click", () => action({ action: "stop", sessionId: s.id }));
     if (!live) stop.setAttribute("disabled", "");
     list.append(
       el(
         "li",
         { class: "session" },
-        el("div", { class: "row-head" }, el("strong", {}, s.title), el("span", { class: `pill ${live ? "on" : ""}` }, live ? "in control" : s.interrupted ? "stopped" : "idle"), stop),
+        el("div", { class: "row-head" }, el("strong", {}, s.title), el("span", { class: `pill ${acting ? "on" : ""}` }, s.interrupted ? "stopped" : acting ? "in control" : live ? "idle" : "no tabs"), open, stop),
         tabs,
       ),
     );
   }
   $("#no-sessions").hidden = state.sessions.length > 0;
-  $("#stop-all").hidden = !state.sessions.some((s) => s.tabs.some((t) => t.controlled));
+  $("#stop-all").hidden = !state.sessions.some((s) => s.tabs.length > 0 && !s.interrupted);
 }
 
 $("#stop-all").addEventListener("click", () => action({ action: "stop-all" }));

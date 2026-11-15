@@ -2,8 +2,8 @@
 // local daemon open even while this worker sleeps); this file holds all browser logic.
 
 import type { EventMessage, RequestMessage, ResponseMessage } from "../../src/protocol";
-import { detach, isAttached, onCdpEvent, onDetach } from "./cdp";
-import { dispatch, forgetTab, hideOverlay, onDialog, onTabNavigated, relayTabs, showOverlay } from "./commands";
+import { detach, detachIdle, idleTabs, isAttached, onCdpEvent, onDetach, wasIdleDetached } from "./cdp";
+import { dispatch, forgetTab, hasDialog, hideOverlay, onDialog, onStopRequest, onTabNavigated, relayTabs, showOverlay } from "./commands";
 import {
   ActionError,
   addTab,
@@ -60,7 +60,35 @@ async function interruptSession(s: Session, reason: string): Promise<void> {
   postEvent({ type: "event", sessionId: s.id, event: "interrupted", data: { reason } });
 }
 
+onStopRequest((s, reason) => interruptSession(s, reason));
+
+// ---- Idle detach ---------------------------------------------------------------------------
+// Chrome shows "T3 Browser started debugging this browser" while any tab is attached. When the
+// agent has not touched a tab for a while, detach from it: the bar goes away and the tab stays
+// in the thread (overlay, ownership and Esc keep working). The next command reattaches.
+
+let idleTimer: ReturnType<typeof setTimeout> | undefined;
+
+async function detachIdleTabs(): Promise<void> {
+  const { idleDetachMs } = await getSettings();
+  for (const tabId of idleTabs(idleDetachMs)) {
+    // agent-browser on the relay expects a persistent session; an open dialog needs its events.
+    if (relayTabs.has(tabId) || hasDialog(tabId)) continue;
+    // A command may have started while we detached the previous tab.
+    if (!idleTabs(idleDetachMs).includes(tabId)) continue;
+    await detachIdle(tabId);
+  }
+}
+
+async function scheduleIdleDetach(): Promise<void> {
+  const { idleDetachMs } = await getSettings();
+  clearTimeout(idleTimer);
+  idleTimer = setTimeout(() => void detachIdleTabs(), idleDetachMs + 250);
+}
+
 async function handleRpc(req: RequestMessage): Promise<ResponseMessage> {
+  // The control page polls status; that is not the agent being busy.
+  if (req.method !== "status") void scheduleIdleDetach();
   try {
     const result = await dispatch(req.session, req.method, req.params ?? {});
     return { type: "response", id: req.id, result };
@@ -88,6 +116,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       transportConnected = !!message.connected;
       setBadge();
       return false;
+    case "open-thread": {
+      // The page pill's thread link: open the thread in T3 Code next to the tab.
+      const tab = sender.tab;
+      if (tab?.id === undefined) return false;
+      void sessionForTab(tab.id).then(async (s) => {
+        if (s?.link) await chrome.tabs.create({ url: s.link, index: tab.index + 1, windowId: tab.windowId });
+      });
+      return false;
+    }
     case "interrupt": {
       const tabId = sender.tab?.id;
       if (tabId === undefined) return false;
@@ -180,7 +217,8 @@ chrome.tabs.onCreated.addListener((tab) => {
 });
 
 chrome.tabs.onUpdated.addListener(async (tabId, change) => {
-  if (change.status !== "complete" || !isAttached(tabId)) return;
+  // Also while idle-detached: the tab is still the agent's, so the pill and Esc stay.
+  if (change.status !== "complete" || !(isAttached(tabId) || wasIdleDetached(tabId))) return;
   const s = await sessionForTab(tabId);
   if (s && !s.interrupted) await showOverlay(tabId, s);
 });
@@ -190,6 +228,11 @@ chrome.tabs.onUpdated.addListener(async (tabId, change) => {
 chrome.runtime.onInstalled.addListener(() => void ensureOffscreen());
 chrome.runtime.onStartup.addListener(() => void ensureOffscreen());
 chrome.alarms.create("keepalive", { periodInMinutes: 0.5 });
-chrome.alarms.onAlarm.addListener((a) => a.name === "keepalive" && void ensureOffscreen());
+chrome.alarms.onAlarm.addListener((a) => {
+  if (a.name !== "keepalive") return;
+  void ensureOffscreen();
+  // Backstop for the timer above, in case the service worker slept in between.
+  void detachIdleTabs();
+});
 void ensureOffscreen();
 setBadge();

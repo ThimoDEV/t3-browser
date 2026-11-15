@@ -10,6 +10,8 @@ export const EXTENSION_ID = "doaacelnfjdbbfhhkglnkdgboeajnlhk";
 export interface SessionInfo {
   id: string;
   title: string;
+  /** Link to the thread in T3 Code, when known (shown in the popup and on the page pill). */
+  link?: string;
 }
 
 export interface TabInfo {
@@ -96,6 +98,8 @@ export const EXTENSION_METHODS = [
   "cdp.detach",
   "cdp.send",
   "extension.reload",
+  "session.stop",
+  "page.peek",
 ] as const;
 
 export type ExtensionMethod = (typeof EXTENSION_METHODS)[number];

@@ -30,6 +30,16 @@ const pages = {
      <div class="modal"><div>Cookie banner <button onclick="this.closest('.modal').remove()">Accept cookies</button></div></div>`,
   ),
   "/page2.html": page("Page two", `<h1>Second page</h1><p>You made it.</p>`),
+  "/upload.html": page(
+    "Upload",
+    `<label>Attachment <input type="file" id="file"></label><p id="out"></p>
+     <script>
+       document.getElementById("file").onchange = async (e) => {
+         const f = e.target.files[0];
+         document.getElementById("out").textContent = f.name + ": " + (await f.text());
+       };
+     </script>`,
+  ),
   "/frame.html": page("Frame", `<button onclick="this.textContent='Frame clicked'">Inside frame</button>`),
 };
 

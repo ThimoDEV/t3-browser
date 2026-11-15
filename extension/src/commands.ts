@@ -2,7 +2,7 @@
 // thread's Session and validated-ish params, and returns JSON (screenshots as base64).
 
 import type { SessionInfo, TabInfo } from "../../src/protocol";
-import { attach, detach, isAttached, send } from "./cdp";
+import { attach, detach, isAttached, markBusy, onDocumentReplaced, send } from "./cdp";
 import { parseKey } from "./keys";
 import {
   ActionError,
@@ -39,6 +39,7 @@ export function refsFor(tabId: number): RefAllocator {
 export function onTabNavigated(tabId: number): void {
   refAllocators.get(tabId)?.reset();
 }
+onDocumentReplaced(onTabNavigated);
 
 const dialogWaiters = new Map<number, Set<() => void>>();
 
@@ -175,11 +176,27 @@ async function centerOf(tabId: number, backendNodeId: number): Promise<{ x: numb
   }
 }
 
+/** Tabs where the overlay is (meant to be) showing. */
+const overlayShown = new Set<number>();
+
 export async function showOverlay(tabId: number, s: Session): Promise<void> {
-  await overlay(tabId, "show", `T3 Code is using this tab · ${s.title}`);
+  overlayShown.add(tabId);
+  await overlay(tabId, "show", `T3 Code is using this tab · ${s.title}`, !!s.link);
+}
+
+/** A dialog is open on the tab (keep the debugger attached so its events keep flowing). */
+export function hasDialog(tabId: number): boolean {
+  return dialogs.has(tabId);
+}
+
+let stopHandler: ((s: Session, reason: string) => Promise<void>) | undefined;
+/** The background registers how to interrupt a thread (Esc / Stop use the same path). */
+export function onStopRequest(fn: (s: Session, reason: string) => Promise<void>): void {
+  stopHandler = fn;
 }
 
 export async function hideOverlay(tabId: number): Promise<void> {
+  overlayShown.delete(tabId);
   await overlay(tabId, "hide");
 }
 
@@ -350,7 +367,7 @@ export const handlers: Record<string, (s: Session, p: Params) => Promise<unknown
     const tabs = await Promise.all(s.tabIds.map((id) => chrome.tabs.get(id).catch(() => undefined)));
     const group = s.groupId === undefined ? undefined : await chrome.tabGroups.get(s.groupId).catch(() => undefined);
     return {
-      session: { id: s.id, title: s.title, groupId: group?.id, ...(group ? { group: { title: group.title, color: group.color, windowId: group.windowId } } : {}) },
+      session: { id: s.id, title: s.title, link: s.link, groupId: group?.id, ...(group ? { group: { title: group.title, color: group.color, windowId: group.windowId } } : {}) },
       tabs: tabs.filter(Boolean).map((t) => tabInfo(t!, s)),
       userAgent: navigator.userAgent,
     };
@@ -664,6 +681,29 @@ export const handlers: Record<string, (s: Session, p: Params) => Promise<unknown
     }
   },
 
+  /**
+   * The control page's Peek button. Unlike page.screenshot it never consumes an Esc/Stop
+   * notice meant for the agent, and it refuses once the thread is stopped.
+   */
+  async "page.peek"(s, p) {
+    const tabId = Number(p.tabId);
+    if (s.interrupted) throw new ActionError("This thread is stopped.", "interrupted");
+    assertOwnsTab(s, tabId);
+    assertUsableTab(await chrome.tabs.get(tabId));
+    if (dialogs.has(tabId)) throw new ActionError("A dialog is open on this tab; the agent has to answer it first.", "dialog_open");
+    // Leave the tab exactly as it was: overlay only if it was showing, debugger only if attached.
+    const wasAttached = isAttached(tabId);
+    const hadOverlay = overlayShown.has(tabId);
+    if (!wasAttached) await attach(tabId);
+    if (hadOverlay) await overlay(tabId, "hide");
+    try {
+      return { mimeType: "image/jpeg", data: await captureEvenIfHidden(tabId, { format: "jpeg", quality: 70 }) };
+    } finally {
+      if (hadOverlay) await overlay(tabId, "show", `T3 Code is using this tab · ${s.title}`, !!s.link);
+      if (!wasAttached) await detach(tabId);
+    }
+  },
+
   async "page.read"(s, p) {
     const tabId = Number(p.tabId);
     await prepare(s, tabId);
@@ -741,7 +781,16 @@ export const handlers: Record<string, (s: Session, p: Params) => Promise<unknown
     await takeInterrupt(s);
     assertOwnsTab(s, tabId);
     const dialog = dialogs.get(tabId);
-    if (!dialog) throw new ActionError("No dialog is open on this tab.");
+    if (!dialog) {
+      // A dialog that opened while the debugger was detached (idle) was never reported: try anyway.
+      if (!isAttached(tabId)) await attach(tabId);
+      try {
+        await send(tabId, "Page.handleJavaScriptDialog", { accept: !!p.accept, promptText: p.promptText });
+      } catch {
+        throw new ActionError("No dialog is open on this tab.");
+      }
+      return { handled: { type: "dialog" }, accepted: !!p.accept };
+    }
     await send(tabId, "Page.handleJavaScriptDialog", { accept: !!p.accept, promptText: p.promptText });
     dialogs.delete(tabId);
     return { handled: dialog, accepted: !!p.accept };
@@ -773,6 +822,12 @@ export const handlers: Record<string, (s: Session, p: Params) => Promise<unknown
     }
     await dropSession(s.id);
     return { released: true, kept };
+  },
+
+  /** Stop the thread as if the user pressed Stop (used by the remote control page). */
+  async "session.stop"(s, p) {
+    await stopHandler?.(s, String(p.reason ?? "pressed Stop on the T3 Browser control page"));
+    return { stopped: s.id };
   },
 
   /** Load the build that is on disk now (used by `t3-browser reload-extension` after a rebuild). */
@@ -817,5 +872,12 @@ export async function dispatch(info: SessionInfo, method: string, params: Params
   const handler = handlers[method];
   if (!handler) throw new ActionError(`Unknown method ${method}`, "unknown_method");
   const s = await getSession(info);
-  return handler(s, params);
+  const tabId = Number(params.tabId);
+  if (!Number.isInteger(tabId)) return handler(s, params);
+  const done = markBusy(tabId);
+  try {
+    return await handler(s, params);
+  } finally {
+    done();
+  }
 }
