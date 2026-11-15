@@ -2,7 +2,7 @@
 // thread's Session and validated-ish params, and returns JSON (screenshots as base64).
 
 import type { SessionInfo, TabInfo } from "../../src/protocol";
-import { attach, detach, isAttached, markBusy, onDocumentReplaced, send } from "./cdp";
+import { attach, busyCount, detach, detachIdle, isAttached, markBusy, onDocumentReplaced, send } from "./cdp";
 import { parseKey } from "./keys";
 import {
   ActionError,
@@ -12,12 +12,18 @@ import {
   assertWebUrl,
   dropSession,
   getSession,
+  persist,
   placeForNewTab,
   renameSession,
   sessionForTab,
   takeInterrupt,
+  threadColorHex,
+  threadInk,
+  unmarkTab,
   type Session,
 } from "./sessions";
+import { threadGroupTitle } from "./identity";
+import { createQueue } from "./serial";
 import { formatAXTree, RefAllocator, type AXNode } from "./snapshot";
 import { isWebUrl, normalizeUrl, notWebPageMessage } from "./urls";
 
@@ -181,7 +187,11 @@ const overlayShown = new Set<number>();
 
 export async function showOverlay(tabId: number, s: Session): Promise<void> {
   overlayShown.add(tabId);
-  await overlay(tabId, "show", `T3 Code is using this tab · ${s.title}`, !!s.link);
+  await overlay(tabId, "show", overlayLabel(s), !!s.link, threadColorHex(s), s.num ? `T3 #${s.num}` : "T3 Code", threadInk(s));
+}
+
+function overlayLabel(s: Session): string {
+  return `T3 Code${s.num ? ` #${s.num}` : ""} is using this tab · ${s.title}`;
 }
 
 /** A dialog is open on the tab (keep the debugger attached so its events keep flowing). */
@@ -369,22 +379,52 @@ async function afterAction(tabId: number, before: string | undefined) {
  * (it works when the tab is visible, e.g. in its own window), then briefly bring the tab to
  * the front of its window, capture, and put the user's tab back.
  */
+async function pageVisible(tabId: number): Promise<boolean> {
+  return send<{ result: { value?: boolean } }>(tabId, "Runtime.evaluate", { expression: "document.visibilityState === 'visible'", returnByValue: true }, undefined, 1_000)
+    .then((r) => r.result.value === true)
+    .catch(() => false);
+}
+
+/** One capture at a time: two threads screenshotting at once must not trade the user's tab. */
+const oneAtATime = createQueue();
+
+/**
+ * Tabs the extension itself is bringing to the front (screenshots), so the popup guard in the
+ * background does not mistake that for a popup jumping in front of the user.
+ */
+export const ownActivations = new Set<number>();
+
 async function captureEvenIfHidden(tabId: number, params: Record<string, unknown>): Promise<string> {
-  const tab = await chrome.tabs.get(tabId);
-  if (tab.active) return (await send<{ data: string }>(tabId, "Page.captureScreenshot", params)).data;
-  try {
-    return (await send<{ data: string }>(tabId, "Page.captureScreenshot", params, undefined, 2_500)).data;
-  } catch {
-    // fall through to the visible capture
-  }
-  const [previous] = await chrome.tabs.query({ active: true, windowId: tab.windowId });
-  await chrome.tabs.update(tabId, { active: true });
-  try {
-    await sleep(200);
-    return (await send<{ data: string }>(tabId, "Page.captureScreenshot", params, undefined, 15_000)).data;
-  } finally {
-    if (previous?.id !== undefined && previous.id !== tabId) await chrome.tabs.update(previous.id, { active: true }).catch(() => {});
-  }
+  // Everything goes through the queue, also a tab that is already in front: another thread's
+  // queued capture could otherwise switch it away mid-capture.
+  return oneAtATime(async () => {
+    if (await pageVisible(tabId)) return (await send<{ data: string }>(tabId, "Page.captureScreenshot", params, undefined, 15_000)).data;
+    const tab = await chrome.tabs.get(tabId);
+    const [previous] = await chrome.tabs.query({ active: true, windowId: tab.windowId });
+    ownActivations.add(tabId);
+    setTimeout(() => ownActivations.delete(tabId), 2_000);
+    await chrome.tabs.update(tabId, { active: true });
+    try {
+      // Bounded by the clock, not by attempts: a frozen page must not hold the queue for long.
+      let visible = false;
+      const until = Date.now() + 1_500;
+      while (!visible && Date.now() < until) {
+        await sleep(100);
+        visible = await pageVisible(tabId);
+      }
+      if (!visible) {
+        throw new ActionError(
+          "Chrome is not drawing this tab (its window is minimized or covered), so it cannot be screenshotted right now. Use browser_snapshot or browser_read instead.",
+          "not_visible",
+        );
+      }
+      return (await send<{ data: string }>(tabId, "Page.captureScreenshot", params, undefined, 15_000)).data;
+    } finally {
+      // Hand the user's tab back, unless they moved on to another tab meanwhile.
+      const [now] = await chrome.tabs.query({ active: true, windowId: tab.windowId }).catch(() => []);
+      if (previous?.id !== undefined && previous.id !== tabId && now?.id === tabId) await chrome.tabs.update(previous.id, { active: true }).catch(() => {});
+    }
+  });
 }
 
 // ---------------------------------------------------------------------------------------
@@ -395,7 +435,7 @@ export const handlers: Record<string, (s: Session, p: Params) => Promise<unknown
     const tabs = await Promise.all(s.tabIds.map((id) => chrome.tabs.get(id).catch(() => undefined)));
     const group = s.groupId === undefined ? undefined : await chrome.tabGroups.get(s.groupId).catch(() => undefined);
     return {
-      session: { id: s.id, title: s.title, link: s.link, groupId: group?.id, ...(group ? { group: { title: group.title, color: group.color, windowId: group.windowId } } : {}) },
+      session: { id: s.id, title: s.title, link: s.link, num: s.num, color: s.color, groupId: group?.id, ...(group ? { group: { title: group.title, color: group.color, windowId: group.windowId } } : {}) },
       tabs: tabs.filter(Boolean).map((t) => tabInfo(t!, s)),
       userAgent: navigator.userAgent,
     };
@@ -430,7 +470,7 @@ export const handlers: Record<string, (s: Session, p: Params) => Promise<unknown
     const { windowId, index } = await placeForNewTab(s);
     const tab = await chrome.tabs.create({ url, active, windowId, ...(index !== undefined ? { index } : {}) });
     const tabId = tab.id!;
-    await addTab(s, tabId);
+    await addTab(s, tabId, { opened: true });
     if (active) {
       await chrome.windows.update(windowId, { focused: true }).catch(() => {});
       if (s.groupId !== undefined) await chrome.tabGroups.update(s.groupId, { collapsed: false }).catch(() => {});
@@ -729,8 +769,10 @@ export const handlers: Record<string, (s: Session, p: Params) => Promise<unknown
     try {
       return { mimeType: "image/jpeg", data: await captureEvenIfHidden(tabId, { format: "jpeg", quality: 70 }) };
     } finally {
-      if (hadOverlay) await overlay(tabId, "show", `T3 Code is using this tab · ${s.title}`, !!s.link);
-      if (!wasAttached) await detach(tabId);
+      if (hadOverlay) await showOverlay(tabId, s);
+      // Only undo our own attach, and never under an agent command that started meanwhile
+      // (this peek counts as one busy command itself). The idle sweep tidies up otherwise.
+      if (!wasAttached && busyCount(tabId) <= 1 && !relayTabs.has(tabId) && !dialogs.has(tabId)) await detachIdle(tabId);
     }
   },
 
@@ -842,13 +884,23 @@ export const handlers: Record<string, (s: Session, p: Params) => Promise<unknown
       forgetTab(tabId);
       relayTabs.delete(tabId);
       if (closeTabs && !keep.has(tabId)) await chrome.tabs.remove(tabId).catch(() => {});
-      else if (!keepGroup) await chrome.tabs.ungroup(tabId).catch(() => {});
+      else {
+        if (!keepGroup) await chrome.tabs.ungroup(tabId).catch(() => {});
+        // The tab is the user's again: no thread badge (the next thread may get this number).
+        await unmarkTab(tabId);
+      }
     }
     const kept = keepGroup ? s.tabIds.length : closeTabs ? s.tabIds.filter((id) => keep.has(id)).length : s.tabIds.length;
     if (keepGroup && s.groupId !== undefined) {
+      // A finished thread's group gives up its number and colour, which a new thread may get.
+      // Unlink it from the thread first: recolouring fires the "user recoloured a group"
+      // listener, which must not adopt grey and badge the tabs again.
+      const groupId = s.groupId;
+      s.groupId = undefined;
+      await persist();
       // Collapsing would pull the user off a tab they are looking at; leave the group open then.
-      const watched = await chrome.tabs.query({ groupId: s.groupId, active: true }).catch(() => []);
-      if (!watched.length) await chrome.tabGroups.update(s.groupId, { collapsed: true }).catch(() => {});
+      const watched = await chrome.tabs.query({ groupId, active: true }).catch(() => []);
+      await chrome.tabGroups.update(groupId, { title: threadGroupTitle(undefined, s.title), color: "grey", ...(watched.length ? {} : { collapsed: true }) }).catch(() => {});
     }
     await dropSession(s.id);
     return { released: true, kept };
@@ -886,6 +938,8 @@ export const handlers: Record<string, (s: Session, p: Params) => Promise<unknown
     assertOwnsTab(s, tabId);
     const method = String(p.method);
     if (method === "Page.navigate" && p.params?.url) assertWebUrl(String(p.params.url));
+    // Agents work in the background; only browser_open with focus brings a tab forward.
+    if (method === "Page.bringToFront") return {};
     if (!isAttached(tabId)) await attach(tabId);
     try {
       return await send(tabId, method, p.params, p.childSessionId);

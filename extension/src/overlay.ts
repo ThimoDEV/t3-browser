@@ -13,7 +13,7 @@ interface OverlayApi {
   /** Build that injected this overlay. */
   build?: string;
   /** `hasLink`: the label opens the thread in T3 Code. */
-  show(label: string, hasLink?: boolean): void;
+  show(label: string, hasLink?: boolean, color?: string, tag?: string, ink?: string): void;
   hide(): void;
   /** Glide the agent cursor to (x, y), starting from `from` (or the control pill). Resolves on arrival. */
   moveTo(x: number, y: number, from: Point | null, activity: string | null): Promise<void>;
@@ -58,28 +58,29 @@ declare const __BUILD_ID__: string;
   const root = host.attachShadow({ mode: "closed" });
   root.innerHTML = `
     <style>
-      :host { all: initial; }
+      :host { all: initial; --t3: #7c5cff; --t3-ink: #fff; }
+      .arrow path { fill: var(--t3); }
       .frame {
         position: fixed; inset: 0; pointer-events: none;
-        box-shadow: inset 0 0 0 2px rgba(124, 92, 255, .9), inset 0 0 28px 4px rgba(124, 92, 255, .35);
+        box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--t3) 90%, transparent), inset 0 0 28px 4px color-mix(in srgb, var(--t3) 35%, transparent);
         animation: breathe 2.4s ease-in-out infinite;
       }
-      @keyframes breathe { 50% { box-shadow: inset 0 0 0 2px rgba(124,92,255,.65), inset 0 0 40px 8px rgba(124,92,255,.22); } }
+      @keyframes breathe { 50% { box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--t3) 65%, transparent), inset 0 0 40px 8px color-mix(in srgb, var(--t3) 22%, transparent); } }
       .pill {
         position: fixed; left: 50%; bottom: 18px; transform: translateX(-50%);
         display: flex; align-items: center; gap: 10px;
         font: 500 13px/1 system-ui, -apple-system, "Segoe UI", sans-serif;
         color: #f5f3ff; background: rgba(24, 20, 38, .92);
-        border: 1px solid rgba(124, 92, 255, .6); border-radius: 999px;
+        border: 1px solid color-mix(in srgb, var(--t3) 60%, transparent); border-radius: 999px;
         padding: 9px 14px; box-shadow: 0 6px 24px rgba(0,0,0,.35);
         pointer-events: auto; user-select: none;
       }
-      .dot { width: 8px; height: 8px; border-radius: 50%; background: #8b6cff; box-shadow: 0 0 0 0 rgba(139,108,255,.7); animation: ping 1.6s infinite; }
-      @keyframes ping { 70% { box-shadow: 0 0 0 8px rgba(139,108,255,0); } 100% { box-shadow: 0 0 0 0 rgba(139,108,255,0); } }
+      .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--t3); box-shadow: 0 0 0 0 color-mix(in srgb, var(--t3) 70%, transparent); animation: ping 1.6s infinite; }
+      @keyframes ping { 70% { box-shadow: 0 0 0 8px color-mix(in srgb, var(--t3) 0%, transparent); } 100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--t3) 0%, transparent); } }
       kbd { font: 600 11px/1 ui-monospace, monospace; background: rgba(255,255,255,.12); border-radius: 4px; padding: 3px 5px; }
-      button { all: unset; cursor: pointer; color: #c4b5fd; font-weight: 600; }
+      button { all: unset; cursor: pointer; color: color-mix(in srgb, var(--t3) 45%, #fff); font-weight: 600; }
       button:hover { color: #fff; }
-      .label.link { cursor: pointer; text-decoration: underline; text-decoration-color: rgba(196,181,253,.5); text-underline-offset: 3px; }
+      .label.link { cursor: pointer; text-decoration: underline; text-decoration-color: color-mix(in srgb, var(--t3) 50%, transparent); text-underline-offset: 3px; }
       .label.link:hover { color: #fff; }
 
       /* The agent's cursor. Its tip sits exactly on the point the agent acts on. */
@@ -96,14 +97,14 @@ declare const __BUILD_ID__: string;
       .tag {
         position: absolute; left: 18px; top: 22px; white-space: nowrap;
         font: 600 11px/1 system-ui, -apple-system, "Segoe UI", sans-serif;
-        color: #fff; background: #6d4aff; border-radius: 999px 999px 999px 4px;
+        color: var(--t3-ink); background: var(--t3); border-radius: 999px 999px 999px 4px;
         padding: 5px 8px; box-shadow: 0 2px 8px rgba(20, 10, 50, .35);
       }
       .tag .dots::after { content: ""; animation: dots 1.2s steps(4) infinite; }
       @keyframes dots { 0% { content: ""; } 25% { content: "."; } 50% { content: ".."; } 75% { content: "..."; } }
       .ripple {
         position: fixed; width: 34px; height: 34px; margin: -17px 0 0 -17px; border-radius: 50%;
-        border: 2px solid rgba(139, 108, 255, .9); background: rgba(139, 108, 255, .22);
+        border: 2px solid color-mix(in srgb, var(--t3) 90%, transparent); background: color-mix(in srgb, var(--t3) 22%, transparent);
         pointer-events: none;
       }
       .hidden { display: none !important; }
@@ -112,7 +113,7 @@ declare const __BUILD_ID__: string;
     <div class="cursor">
       <svg class="arrow" viewBox="0 0 22 26" aria-hidden="true">
         <path d="M2 2 L2 21 L7.2 16.4 L10.6 24 L14 22.5 L10.7 15 L18 15 Z"
-              fill="#7c5cff" stroke="#fff" stroke-width="1.6" stroke-linejoin="round" />
+              stroke="#fff" stroke-width="1.6" stroke-linejoin="round" />
       </svg>
       <span class="tag"><span class="text">T3 Code</span><span class="dots"></span></span>
     </div>
@@ -128,6 +129,7 @@ declare const __BUILD_ID__: string;
   const stop = root.querySelector("button") as HTMLButtonElement;
 
   let visible = false;
+  let restingTag = "T3 Code";
   let escSuppressedUntil = 0;
   let passthroughTimer = 0;
   let at: Point | null = null;
@@ -165,7 +167,7 @@ declare const __BUILD_ID__: string;
   const animate = () => !document.hidden && !matchMedia("(prefers-reduced-motion: reduce)").matches;
 
   const setActivity = (text: string | null) => {
-    tagText.textContent = text ?? "T3 Code";
+    tagText.textContent = text ?? restingTag;
     tagDots.classList.toggle("hidden", !text);
   };
   setActivity(null);
@@ -189,7 +191,12 @@ declare const __BUILD_ID__: string;
 
   window.__t3BrowserOverlay = {
     build: BUILD,
-    show(text: string, hasLink?: boolean) {
+    show(text: string, hasLink?: boolean, color?: string, tag?: string, ink?: string) {
+      // The thread's colour and number, so two threads' tabs never look alike.
+      if (color && /^#[0-9a-f]{6}$/i.test(color)) host.style.setProperty("--t3", color);
+      if (ink && /^#[0-9a-f]{6}$/i.test(ink)) host.style.setProperty("--t3-ink", ink);
+      if (tag) restingTag = tag;
+      setActivity(null);
       label.textContent = text;
       label.classList.toggle("link", !!hasLink);
       label.title = hasLink ? "Open this thread in T3 Code" : "";

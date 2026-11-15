@@ -3,19 +3,22 @@
 
 import type { EventMessage, RequestMessage, ResponseMessage } from "../../src/protocol";
 import { detach, detachIdle, idleTabs, isAttached, onCdpEvent, onDetach, wasIdleDetached } from "./cdp";
-import { dispatch, forgetTab, hasDialog, hideOverlay, onDialog, onStopRequest, onTabNavigated, relayTabs, showOverlay } from "./commands";
+import { dispatch, forgetTab, hasDialog, hideOverlay, onDialog, onStopRequest, onTabNavigated, ownActivations, relayTabs, showOverlay } from "./commands";
 import {
   ActionError,
   addTab,
   allSessions,
   getSettings,
   markInterrupted,
+  markTab,
+  adoptGroupColor,
   removeTab,
   sessionForTab,
   takeInterrupt,
   updateSettings,
   type Session,
 } from "./sessions";
+import { tabBefore, tabToRestore } from "./focus";
 import { isUsableTabUrl } from "./urls";
 
 const OFFSCREEN_URL = "offscreen.html";
@@ -168,6 +171,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         if (message.action === "stop") {
           const s = (await allSessions()).find((x) => x.id === message.sessionId);
           if (s) await interruptSession(s, "clicked Stop in the extension");
+        } else if (message.action === "show") {
+          // Select all of a thread's tabs (in the window holding most of them) and bring it up.
+          const s = (await allSessions()).find((x) => x.id === message.sessionId);
+          const tabs = s ? (await Promise.all(s.tabIds.map((id) => chrome.tabs.get(id).catch(() => undefined)))).filter((t): t is chrome.tabs.Tab => !!t) : [];
+          if (tabs.length) {
+            const byWindow = new Map<number, chrome.tabs.Tab[]>();
+            for (const t of tabs) byWindow.set(t.windowId, [...(byWindow.get(t.windowId) ?? []), t]);
+            const [windowId, here] = [...byWindow].sort((a, b) => b[1].length - a[1].length)[0];
+            if (s!.groupId !== undefined) await chrome.tabGroups.update(s!.groupId, { collapsed: false }).catch(() => {});
+            await chrome.tabs.highlight({ windowId, tabs: here.map((t) => t.index) }).catch(() => {});
+            await chrome.windows.update(windowId, { focused: true }).catch(() => {});
+          }
         } else if (message.action === "stop-all") {
           for (const s of await allSessions()) await interruptSession(s, "clicked Stop all in the extension");
         } else if (message.action === "settings") {
@@ -202,7 +217,13 @@ onDetach(async (tabId, reason) => {
   if (!s) return;
   postEvent({ type: "event", sessionId: s.id, event: "cdp.detached", data: { tabId, reason } });
   // The user clicked "Cancel" on Chrome's "is debugging this browser" bar.
-  if (reason === "canceled_by_user") await interruptSession(s, "cancelled debugging from Chrome's banner");
+  // "Cancel" on Chrome's debugging bar means: stop debugging this browser. That is every
+  // thread holding tabs, also the ones whose tabs are idle-detached right now.
+  if (reason === "canceled_by_user") {
+    for (const other of await allSessions()) {
+      if (other.tabIds.length && !other.interrupted) await interruptSession(other, "cancelled debugging from Chrome's banner");
+    }
+  }
 });
 
 // ---- Tab lifecycle -----------------------------------------------------------------------
@@ -225,16 +246,97 @@ async function adoptChildTab(tabId: number, sourceTabId: number): Promise<void> 
   await addTab(s, tabId).catch(() => {});
   postEvent({ type: "event", sessionId: s.id, event: "tab.created", data: { tabId, openerTabId: sourceTabId } });
 }
-chrome.webNavigation.onCreatedNavigationTarget.addListener((d) => void adoptChildTab(d.tabId, d.sourceTabId));
+// Which tab was in front before, per window, to undo a popup that jumped in front of the user.
+const activeTab = new Map<number, number>();
+const previousTab = new Map<number, number>();
+/** Tabs just opened by a page (popup, target=_blank), with the tab that opened them. */
+const openedBy = new Map<number, { source: number; at: number; authoritative: boolean }>();
+void chrome.tabs.query({ active: true }).then((ts) => ts.forEach((t) => t.id !== undefined && activeTab.set(t.windowId, t.id)));
+
+/** New tabs already judged once (an opener reported late must not reopen the question). */
+const decided = new Set<number>();
+
+/**
+ * Remember who opened a new tab. webNavigation's source is the page that really opened it;
+ * tabs.onCreated's openerTabId can be the tab that happened to be in front (seen in Chrome 157),
+ * so it only fills in until the real source is known.
+ */
+function noteChild(tabId: number, source: number, authoritative: boolean): void {
+  if (decided.has(tabId)) return;
+  const known = openedBy.get(tabId);
+  if (known && !authoritative) return;
+  openedBy.set(tabId, { source, at: known?.at ?? Date.now(), authoritative });
+  setTimeout(() => openedBy.delete(tabId), 5_000);
+}
+
+/**
+ * A page the agent works in from the background opened a popup or a target=_blank tab, and
+ * Chrome brought it to the front. Agents work in the background: put the user's tab back.
+ * (When the agent's tab itself was in front, the user is watching it; leave things alone.)
+ */
+async function keepUserInFront(tabId: number, windowId: number, before: number | undefined): Promise<void> {
+  await new Promise((r) => setTimeout(r, 50)); // the opener may be reported just after activation
+  // Wait (briefly) for the real opener: until then the opener may just be the tab in front.
+  for (let i = 0; i < 6 && openedBy.get(tabId) && !openedBy.get(tabId)!.authoritative; i++) await new Promise((r) => setTimeout(r, 50));
+  const child = openedBy.get(tabId);
+  if (!child) return;
+  const restore = tabToRestore({
+    tabId,
+    source: child.source,
+    sourceIsAgentTab: !!(await sessionForTab(child.source)),
+    ageMs: Date.now() - child.at,
+    before,
+    ownActivation: ownActivations.has(tabId),
+    alreadyDecided: decided.has(tabId),
+  });
+  // Creation is often reported before activation: until the new tab is really in front, there
+  // is nothing to decide yet (its activation event will ask again).
+  if (restore !== undefined && activeTab.get(windowId) !== tabId) return;
+  // One decision per new tab: whatever happens to it later is somebody's choice.
+  openedBy.delete(tabId);
+  decided.add(tabId);
+  setTimeout(() => decided.delete(tabId), 10_000);
+  if (restore !== undefined) await chrome.tabs.update(restore, { active: true }).catch(() => {});
+}
+
+chrome.tabs.onActivated.addListener(({ tabId, windowId }) => {
+  const before = activeTab.get(windowId);
+  if (before !== undefined && before !== tabId) previousTab.set(windowId, before);
+  activeTab.set(windowId, tabId);
+  void keepUserInFront(tabId, windowId, before);
+});
+
+chrome.webNavigation.onCreatedNavigationTarget.addListener((d) => {
+  noteChild(d.tabId, d.sourceTabId, true);
+  void adoptChildTab(d.tabId, d.sourceTabId);
+});
 chrome.tabs.onCreated.addListener((tab) => {
-  if (tab.openerTabId !== undefined && tab.id !== undefined) void adoptChildTab(tab.id, tab.openerTabId);
+  if (tab.openerTabId === undefined || tab.id === undefined) return;
+  noteChild(tab.id, tab.openerTabId, false);
+  void adoptChildTab(tab.id, tab.openerTabId);
+  // Activation is often reported before the opener is known: check again now that it is.
+  // "Before" is the tab in front, unless the new tab already is (then the one before that).
+  if (tab.active) {
+    void keepUserInFront(tab.id, tab.windowId, tabBefore(tab.id, activeTab.get(tab.windowId), previousTab.get(tab.windowId)));
+  }
 });
 
 chrome.tabs.onUpdated.addListener(async (tabId, change) => {
+  // Chrome may drop a tab's own badge when it navigates: put the thread's number back.
+  if (change.status === "loading") {
+    const owner = await sessionForTab(tabId);
+    if (owner) await markTab(owner, tabId);
+  }
   // Also while idle-detached: the tab is still the agent's, so the pill and Esc stay.
   if (change.status !== "complete" || !(isAttached(tabId) || wasIdleDetached(tabId))) return;
   const s = await sessionForTab(tabId);
   if (s && !s.interrupted) await showOverlay(tabId, s);
+});
+
+// The user recoloured a thread's group: badges follow at once, overlays on their next show.
+chrome.tabGroups.onUpdated.addListener(async (group) => {
+  const s = await adoptGroupColor(group.id, group.color);
+  if (s) for (const tabId of s.tabIds) if (isAttached(tabId) || wasIdleDetached(tabId)) await showOverlay(tabId, s);
 });
 
 // ---- Lifecycle ---------------------------------------------------------------------------

@@ -72,7 +72,17 @@ export function isAttached(tabId: number): boolean {
   return attached.has(tabId);
 }
 
+/** Detaches in progress: an attach waits for them instead of racing them. */
+const detaching = new Map<number, Promise<void>>();
+
+/** Commands running on the tab right now (see markBusy). */
+export function busyCount(tabId: number): number {
+  return busy.get(tabId) ?? 0;
+}
+
 export async function attach(tabId: number): Promise<void> {
+  const leaving = detaching.get(tabId);
+  if (leaving) await leaving.catch(() => {});
   if (attached.has(tabId)) return;
   const inFlight = attaching.get(tabId);
   if (inFlight) return inFlight;
@@ -86,8 +96,18 @@ export async function attach(tabId: number): Promise<void> {
       ]).finally(() => clearTimeout(timer));
     } catch (err) {
       const msg = String((err as Error).message ?? err);
-      // Already attached by us in a previous service-worker life: adopt it.
-      if (!/already attached/i.test(msg)) {
+      // "Already attached" is fine when it is us (a previous service-worker life): adopt it.
+      // DevTools or another extension on the tab is not; say so instead of failing later.
+      if (/already attached/i.test(msg)) {
+        // Ours from a previous service-worker life answers commands; someone else's does not.
+        // (getTargets cannot tell: its extensionId describes background pages, not the client.)
+        // Bounded: an open alert() or a frozen page makes the probe hang, and that is still ours.
+        const ours = await Promise.race([
+          chrome.debugger.sendCommand({ tabId }, "Runtime.evaluate", { expression: "1", returnByValue: true }).then(() => true, () => false),
+          new Promise<boolean>((resolve) => setTimeout(() => resolve(true), 2_000)),
+        ]);
+        if (!ours) throw new Error("Another extension is already debugging this tab. Stop it there (or disable that extension) and try again.");
+      } else {
         throw new Error(
           /Cannot access|chrome:\/\/|chrome-extension:\/\//i.test(msg)
             ? "Chrome does not allow extensions to control this page (browser-internal or Web Store page)."
@@ -129,10 +149,20 @@ export async function detach(tabId: number): Promise<void> {
   lastUsed.delete(tabId);
   idleDetached.delete(tabId);
   if (!attached.has(tabId)) return;
-  const doc = await mainDocument(tabId);
-  if (doc !== undefined) docAtDetach.set(tabId, doc);
+  // Not attached from this moment on, so a command starting now reattaches (after waiting for
+  // this detach) instead of sending into a session that is going away.
   attached.delete(tabId);
-  await chrome.debugger.detach({ tabId }).catch(() => {});
+  const p = (async () => {
+    const doc = await mainDocument(tabId);
+    if (doc !== undefined) docAtDetach.set(tabId, doc);
+    await chrome.debugger.detach({ tabId }).catch(() => {});
+  })();
+  detaching.set(tabId, p);
+  try {
+    await p;
+  } finally {
+    if (detaching.get(tabId) === p) detaching.delete(tabId);
+  }
 }
 
 const SEND_TIMEOUT_MS = 30_000;

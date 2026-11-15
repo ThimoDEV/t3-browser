@@ -54,5 +54,8 @@ kbd { font: 600 11px ui-monospace, monospace; border: 1px solid var(--line); bor
 .tabs { list-style: none; padding: 0; margin: 6px 0 0; color: var(--muted); font-size: 12px; }
 .tabs li { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; padding: 1px 0; }
 .tabs li:hover { color: var(--fg); }
+.chip { flex: none; font: 700 11px/1 system-ui, sans-serif; color: #fff; border-radius: 999px; padding: 3px 7px; }
+.toggle { display: flex; gap: 8px; align-items: flex-start; cursor: pointer; }
+.toggle small { font-size: 11px; }
 .pill { font-size: 11px; border-radius: 999px; padding: 1px 7px; border: 1px solid var(--line); color: var(--muted); }
 .pill.on { color: var(--accent); border-color: var(--accent); }

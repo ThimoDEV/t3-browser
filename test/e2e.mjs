@@ -219,11 +219,13 @@ async function call(name, args = {}) {
 async function inExtension(expression) {
   const { targetInfos } = await user.send("Target.getTargets");
   // By ID: Chrome ships built-in extensions with a background.js worker too.
-  const sw = targetInfos.find((t) => t.type === "service_worker" && t.url.startsWith(`chrome-extension://${EXTENSION_ID}/`));
+  // The newest one: after a worker restart Chrome may still list the old instance.
+  const sw = targetInfos.filter((t) => t.type === "service_worker" && t.url.startsWith(`chrome-extension://${EXTENSION_ID}/`)).at(-1);
   assert.ok(sw, "extension service worker not found");
   return user.evalIn(sw.targetId, expression);
 }
 const groupOf = (tabId) => inExtension(`chrome.tabs.get(${tabId}).then(t => t.groupId)`);
+const badgeOf = (tabId) => inExtension(`chrome.action.getBadgeText({ tabId: ${tabId} })`);
 
 const EXTENSION_ID = "doaacelnfjdbbfhhkglnkdgboeajnlhk";
 
@@ -268,7 +270,7 @@ await step("open needs no approval and lands in the thread's tab group", async (
   const groupId = status.user.session.groupId;
   assert.ok(groupId >= 0, JSON.stringify(status.user.session));
   assert.equal(await groupOf(tab), groupId, "tab is in the thread group");
-  assert.equal(status.user.session.group.title, "T3 · Signup test", "group is named after the thread");
+  assert.equal(status.user.session.group.title, "T3 #1 · Signup test", "group is named after the thread, with its number");
 });
 
 await step("a second tab joins the same group, right after the first", async () => {
@@ -494,10 +496,10 @@ await step("the tab group is named after the T3 Code thread, and settling the th
     let status;
     for (let i = 0; i < 25; i++) {
       status = await agent.call("browser_status");
-      if (status.user.session.group?.title === "T3 · Plan the team offsite") break;
+      if (/^T3 #\d+ · Plan the team offsite$/.test(status.user.session.group?.title ?? "")) break;
       await sleep(200);
     }
-    assert.equal(status.user.session.group.title, "T3 · Plan the team offsite");
+    assert.match(status.user.session.group.title, /^T3 #\d+ · Plan the team offsite$/);
     assert.equal(status.user.session.link, "https://app.t3.codes/threads/e2e-offsite", "the thread link reaches the extension");
     const groupId = status.user.session.groupId;
     assert.equal(await groupOf(opened.tab), groupId);
@@ -532,6 +534,7 @@ await step("a thread whose agent goes away gets its tabs released", async () => 
     attached = await inExtension(`chrome.debugger.getTargets().then(ts => ts.find(t => t.tabId === ${opened.tab})?.attached)`);
   }
   assert.equal(attached, false, "released after the grace period");
+  assert.equal(await badgeOf(opened.tab), "", "the released tab no longer carries the thread's badge");
   assert.equal(await groupOf(opened.tab), groupId, "the tab stays in its group for the user");
   await inExtension(`chrome.tabs.remove(${opened.tab})`);
 });
@@ -712,9 +715,123 @@ await step("the toolbar icon shows the real connection after Chrome restarts the
   assert.equal(shown, "", "still shows as connected after the restart");
 });
 
+// ---- Several threads at once ---------------------------------------------------------------
+/** The tab in front in the window that holds thread #1's tab. */
+const activeTabId = () => inExtension(`chrome.tabs.get(${tab}).then((t) => chrome.tabs.query({ active: true, windowId: t.windowId })).then(([a]) => a.id)`);
+let second;
+let secondTab;
+
+await step("each thread gets its own number and colour: on its group, its toolbar badge and its overlay", async () => {
+  const mine = (await call("browser_status")).json.user.session;
+  assert.deepEqual([mine.num, mine.color], [1, "purple"]);
+  assert.equal(await badgeOf(tab), "#1");
+
+  second = await startAgent({ T3_BROWSER_SESSION_ID: "e2e-second", T3_BROWSER_SESSION_TITLE: "Second thread" });
+  secondTab = (await second.call("browser_open", { url: `${site}/page2.html?second`, focus: true })).tab;
+  const theirs = (await second.call("browser_status")).user.session;
+  assert.equal(theirs.num, 2);
+  assert.notEqual(theirs.color, "purple", "a different colour from thread #1");
+  assert.equal(theirs.group.title, "T3 #2 · Second thread");
+  assert.equal(theirs.group.color, theirs.color);
+  assert.equal(await badgeOf(secondTab), "#2");
+  // The overlay takes the thread's colour (the host element carries it).
+  const tint = await second.call("browser_eval", { tab: secondTab, expression: "document.querySelector('t3-browser-overlay').style.getPropertyValue('--t3')" });
+  assert.match(tint.value, /^#[0-9a-f]{6}$/);
+  assert.notEqual(tint.value, "#7c5cff");
+});
+
+await step("two tabs opened at once by a new thread end up in one group", async () => {
+  const third = await startAgent({ T3_BROWSER_SESSION_ID: "e2e-third", T3_BROWSER_SESSION_TITLE: "Third thread" });
+  try {
+    const [a, b] = await Promise.all([third.call("browser_open", { url: `${site}/page2.html?a` }), third.call("browser_open", { url: `${site}/page2.html?b` })]);
+    const [ga, gb] = [await groupOf(a.tab), await groupOf(b.tab)];
+    assert.ok(ga >= 0 && ga === gb, `one group, got ${ga} and ${gb}`);
+    await third.call("browser_done", {});
+  } finally {
+    await third.close().catch(() => {});
+  }
+});
+
+let userTab;
+await step("two threads screenshotting background tabs at once leave the user's own tab in front", async () => {
+  // The user's own tab, in front, in the same window as the agents' tabs.
+  userTab = await inExtension(`chrome.tabs.get(${tab}).then((t) => chrome.tabs.create({ url: "${site}/page2.html?users-own-tab", windowId: t.windowId, active: true })).then((t) => t.id)`);
+  await sleep(300);
+  assert.equal(await activeTabId(), userTab);
+  // Four at once, two per thread, so the tab switches really overlap.
+  const shots = await Promise.all([
+    call("browser_screenshot", { tab }),
+    second.call("browser_screenshot", { tab: secondTab }),
+    call("browser_screenshot", { tab }),
+    second.call("browser_screenshot", { tab: secondTab }),
+  ]);
+  assert.ok(shots[0].content.some((c) => c.type === "image") && shots[2].content.some((c) => c.type === "image"), "thread #1 got its screenshots");
+  assert.ok(shots[1] && shots[3], "thread #2 got its screenshots");
+  assert.equal(await activeTabId(), userTab, "the user's tab is in front again");
+});
+
+await step("a popup from an agent's background tab does not take over the user's screen", async () => {
+  await call("browser_navigate", { tab, url: `${site}/form.html` });
+  // Some history first: the user was on another tab X, then came to U.
+  const x = await inExtension(`chrome.tabs.get(${tab}).then((t) => chrome.tabs.create({ url: "${site}/page2.html?earlier-tab", windowId: t.windowId, active: true })).then((t) => t.id)`);
+  await sleep(200);
+  await inExtension(`chrome.tabs.update(${userTab}, { active: true }).then(() => true)`);
+  await sleep(200);
+  assert.equal(await activeTabId(), userTab);
+  const s = (await call("browser_snapshot", { tab })).text;
+  await call("browser_click", { tab, ref: refOf(s, /Open page two in a new tab/) });
+  await sleep(1_000);
+  const front = await activeTabId();
+  const popupId = (await call("browser_tabs")).json.find((t) => t.url.endsWith("/page2.html") && t.mine)?.tab;
+  assert.equal(front, userTab, `the user's tab is in front (front=${front} user=${userTab} earlier=${x} popup=${popupId})`);
+  const tabs = (await call("browser_tabs")).json;
+  const popup = tabs.find((t) => t.url.endsWith("/page2.html") && t.mine);
+  assert.ok(popup, "the new tab still joined the thread");
+  await call("browser_close_tab", { tab: popup.tab });
+  await inExtension(`chrome.tabs.remove(${x}).then(() => true)`);
+});
+
+await step("the user can switch to an agent's new tab on purpose, and the agent can screenshot it right away", async () => {
+  const s = (await call("browser_snapshot", { tab })).text;
+  await call("browser_click", { tab, ref: refOf(s, /Open page two in a new tab/) });
+  const popup = (await call("browser_tabs")).json.find((t) => t.url.endsWith("/page2.html") && t.mine);
+  // Right after it opened, the user clicks the new tab on purpose: it stays in front.
+  await inExtension(`chrome.tabs.update(${popup.tab}, { active: true }).then(() => true)`);
+  await sleep(400);
+  assert.equal(await activeTabId(), popup.tab, "the user's own choice is not undone");
+  // Back to the user's tab; the agent screenshots the new tab, which briefly brings it forward.
+  await inExtension(`chrome.tabs.update(${userTab}, { active: true }).then(() => true)`);
+  const shot = await call("browser_screenshot", { tab: popup.tab });
+  assert.ok(shot.content.some((c) => c.type === "image"), "the screenshot of the new tab worked");
+  assert.equal(await activeTabId(), userTab, "and the user's tab is back in front");
+  await call("browser_close_tab", { tab: popup.tab });
+  await inExtension(`chrome.tabs.update(${userTab}, { active: true }).then(() => true)`);
+  await second.call("browser_done", {});
+  await second.close().catch(() => {});
+});
+
+await step("with grouping from the second tab, a quick one-tab task stays ungrouped", async () => {
+  await inExtension(`chrome.storage.local.get("settings").then(v => chrome.storage.local.set({ settings: { ...(v.settings || {}), groupMode: "multi" } }))`);
+  const lazy = await startAgent({ T3_BROWSER_SESSION_ID: "e2e-lazy", T3_BROWSER_SESSION_TITLE: "Quick task" });
+  try {
+    const one = (await lazy.call("browser_open", { url: `${site}/page2.html?one` })).tab;
+    assert.equal(await groupOf(one), -1, "a single tab is not grouped");
+    assert.match(await badgeOf(one), /^#\d+$/, "but it carries the thread's badge");
+    const two = (await lazy.call("browser_open", { url: `${site}/page2.html?two` })).tab;
+    const [g1, g2] = [await groupOf(one), await groupOf(two)];
+    assert.ok(g1 >= 0 && g1 === g2, "the second tab brings the group, with the first tab in it");
+    await lazy.call("browser_done", {});
+  } finally {
+    await lazy.close().catch(() => {});
+    await inExtension(`chrome.storage.local.get("settings").then(v => chrome.storage.local.set({ settings: { ...(v.settings || {}), groupMode: "always" } }))`);
+  }
+});
+
 await step("browser_done keeps chosen tabs and closes the rest", async () => {
   const before = (await call("browser_tabs")).json.filter((t) => t.browser === "user");
+  assert.equal(await badgeOf(tab), "#1", "the thread's tab carries its badge");
   await call("browser_done", { keepTabs: [tab] });
+  assert.equal(await badgeOf(tab), "", "a tab handed back loses the thread's badge");
   const { targetInfos } = await user.send("Target.getTargets");
   const pages = targetInfos.filter((t) => t.type === "page");
   assert.ok(pages.some((t) => t.url.endsWith("/form.html")), "kept tab survives");

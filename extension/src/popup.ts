@@ -1,3 +1,4 @@
+import { COLOR_HEX } from "./identity";
 import type { Session, Settings } from "./sessions";
 
 interface PopupState {
@@ -42,6 +43,11 @@ async function render() {
       tabs.append(item);
     }
     const stop = el("button", { class: "ghost small" }, "Stop");
+    const show = el("button", { class: "ghost small", title: "Select this thread's tabs" }, "Show");
+    show.addEventListener("click", () => action({ action: "show", sessionId: s.id }));
+    if (!s.tabs.length) show.hidden = true;
+    // The thread's number in its colour: the same as its tab group, overlay and toolbar badge.
+    const chip = el("span", { class: "chip", style: `background:${COLOR_HEX[s.color ?? "purple"]}` }, s.num ? `#${s.num}` : "T3");
     const open = el("button", { class: "ghost small", title: "Open this thread in T3 Code" }, "Thread");
     open.addEventListener("click", () => s.link && chrome.tabs.create({ url: s.link }));
     if (!s.link) open.hidden = true;
@@ -51,16 +57,21 @@ async function render() {
       el(
         "li",
         { class: "session" },
-        el("div", { class: "row-head" }, el("strong", {}, s.title), el("span", { class: `pill ${acting ? "on" : ""}` }, s.interrupted ? "stopped" : acting ? "in control" : live ? "idle" : "no tabs"), open, stop),
+        el("div", { class: "row-head" }, chip, el("strong", {}, s.title), el("span", { class: `pill ${acting ? "on" : ""}` }, s.interrupted ? "stopped" : acting ? "in control" : live ? "idle" : "no tabs"), show, open, stop),
         tabs,
       ),
     );
   }
   $("#no-sessions").hidden = state.sessions.length > 0;
   $("#stop-all").hidden = !state.sessions.some((s) => s.tabs.length > 0 && !s.interrupted);
+  $<HTMLInputElement>("#group-first").checked = state.settings.groupMode !== "multi";
 }
 
 $("#stop-all").addEventListener("click", () => action({ action: "stop-all" }));
+// Off: a thread's single tab stays ungrouped (handy for quick tasks); the group appears with its second tab.
+$<HTMLInputElement>("#group-first").addEventListener("change", (e) =>
+  action({ action: "settings", patch: { groupMode: (e.target as HTMLInputElement).checked ? "always" : "multi" } }),
+);
 
 render();
 setInterval(render, 2000);

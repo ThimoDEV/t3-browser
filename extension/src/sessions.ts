@@ -8,6 +8,8 @@
 // any time to take control back.
 
 import type { SessionInfo } from "../../src/protocol";
+import { allocateIdentity, COLOR_HEX, inkFor, isGroupColor, threadGroupTitle, type GroupColor } from "./identity";
+import { createKeyedQueue } from "./serial";
 import { isUsableTabUrl, isWebUrl, notWebPageMessage } from "./urls";
 
 export interface Session {
@@ -17,6 +19,9 @@ export interface Session {
   named?: boolean;
   /** The thread in T3 Code (web link), when the MCP server could read it. */
   link?: string;
+  /** Number and colour that identify this thread in Chrome (group, overlay, badge); see identity.ts. */
+  num?: number;
+  color?: GroupColor;
   groupId?: number;
   tabIds: number[];
   /** Set by Esc / Stop; reported to the agent once, then cleared. */
@@ -29,12 +34,13 @@ export interface Settings {
   /** Detach the debugger from tabs the agent has not used for this long (ms), so Chrome's
    * "started debugging this browser" bar goes away while the agent is idle. */
   idleDetachMs: number;
+  /** "always": a thread's tabs live in its tab group from the first tab. "multi": a thread with
+   * one tab leaves it ungrouped (quick tasks stay out of the way); the group appears with its
+   * second tab. */
+  groupMode: "always" | "multi";
 }
 
-export const DEFAULT_SETTINGS: Settings = { port: 47823, idleDetachMs: 60_000 };
-
-type GroupColor = "grey" | "blue" | "red" | "yellow" | "green" | "pink" | "purple" | "cyan" | "orange";
-const GROUP_COLORS: GroupColor[] = ["purple", "blue", "cyan", "green", "orange", "pink", "yellow", "red"];
+export const DEFAULT_SETTINGS: Settings = { port: 47823, idleDetachMs: 60_000, groupMode: "always" };
 
 export class ActionError extends Error {
   constructor(
@@ -66,6 +72,7 @@ export async function getSettings(): Promise<Settings> {
   return {
     port: typeof stored.port === "number" ? stored.port : DEFAULT_SETTINGS.port,
     idleDetachMs: typeof stored.idleDetachMs === "number" && stored.idleDetachMs >= 1_000 ? stored.idleDetachMs : DEFAULT_SETTINGS.idleDetachMs,
+    groupMode: stored.groupMode === "multi" ? "multi" : "always",
   };
 }
 
@@ -73,7 +80,7 @@ export async function updateSettings(patch: Partial<Settings>): Promise<Settings
   // Only known keys are written, which also drops settings from older versions
   // (the site allow-list and "trusted" mode).
   const next: Settings = { ...(await getSettings()), ...patch };
-  await chrome.storage.local.set({ settings: { port: next.port, idleDetachMs: next.idleDetachMs } });
+  await chrome.storage.local.set({ settings: { port: next.port, idleDetachMs: next.idleDetachMs, groupMode: next.groupMode } });
   return next;
 }
 
@@ -122,21 +129,37 @@ export async function dropSession(id: string): Promise<void> {
 }
 
 export function groupTitle(s: Session): string {
-  const t = s.title.length > 28 ? s.title.slice(0, 27) + "…" : s.title;
-  return `T3 · ${t}`;
+  return threadGroupTitle(s.num, s.title);
 }
 
-/** Same thread, same colour, across service-worker restarts and new groups. */
-function groupColor(s: Session): GroupColor {
-  let h = 0;
-  for (const ch of s.id) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
-  return GROUP_COLORS[h % GROUP_COLORS.length];
+/** The colour this thread shows in the overlay and badge (T3 purple until it has one). */
+export function threadColorHex(s: Session): string {
+  return COLOR_HEX[s.color ?? "purple"];
+}
+
+export function threadInk(s: Session): string {
+  return inkFor(s.color);
+}
+
+/**
+ * Give the thread a number and colour that no other thread holding tabs is using. Only when it
+ * has none yet, or is (re)starting with its first tab: a thread that already shows its identity
+ * keeps it (e.g. after the user gave another group the same colour on purpose).
+ */
+function ensureIdentity(s: Session): void {
+  if (s.num && s.color && s.tabIds.length > 1) return;
+  const live = [...sessions.values()].filter((o) => o.id !== s.id && o.tabIds.length > 0);
+  const next = allocateIdentity({ num: s.num, color: s.color }, live);
+  s.num = next.num;
+  s.color = next.color;
 }
 
 async function liveGroup(s: Session): Promise<chrome.tabGroups.TabGroup | undefined> {
   if (s.groupId === undefined) return undefined;
   const group = await chrome.tabGroups.get(s.groupId).catch(() => undefined);
   if (!group) s.groupId = undefined;
+  // The user recoloured the group: that is now the thread's colour everywhere.
+  else if (isGroupColor(group.color) && group.color !== s.color) s.color = group.color;
   return group;
 }
 
@@ -151,8 +174,12 @@ export async function placeForNewTab(s: Session): Promise<{ windowId: number; in
     const inGroup = await chrome.tabs.query({ groupId: group.id });
     if (inGroup.length) return { windowId: group.windowId, index: Math.max(...inGroup.map((t) => t.index)) + 1 };
   }
+  // No group yet: right next to the tab the user is on, like a link they opened themselves.
   const win = await chrome.windows.getLastFocused({ windowTypes: ["normal"] }).catch(() => undefined);
-  if (win?.id !== undefined && win.type === "normal") return { windowId: win.id };
+  if (win?.id !== undefined && win.type === "normal") {
+    const [active] = await chrome.tabs.query({ active: true, windowId: win.id });
+    return { windowId: win.id, ...(active ? { index: active.index + 1 } : {}) };
+  }
   const all = await chrome.windows.getAll({ windowTypes: ["normal"] });
   if (all[0]?.id !== undefined) return { windowId: all[0].id };
   const created = await chrome.windows.create({ focused: false });
@@ -171,23 +198,70 @@ async function retryWhileDragging<T>(fn: () => Promise<T>): Promise<T> {
   }
 }
 
-/** Put a tab into the session's tab group, creating the group (named after the thread) if needed. */
-export async function addTab(s: Session, tabId: number): Promise<void> {
+/** One grouping at a time per thread: two tabs opened at once must not each create a group. */
+const withGroupLock = createKeyedQueue();
+
+/**
+ * Add a tab to the thread: give the thread its number and colour, mark the tab, and put it in
+ * the thread's tab group (created on demand, named after the thread). With groupMode "multi" a
+ * thread's only tab stays where it is; the group appears once it has a second tab.
+ */
+export async function addTab(s: Session, tabId: number, opts: { opened?: boolean } = {}): Promise<void> {
   if (!s.tabIds.includes(tabId)) s.tabIds.push(tabId);
-  const tab = await chrome.tabs.get(tabId);
-  const group = await liveGroup(s);
-  if (group && group.windowId === tab.windowId) {
-    if (tab.groupId !== group.id) await retryWhileDragging(() => chrome.tabs.group({ groupId: group.id, tabIds: [tabId] }));
-  } else {
-    // First tab, the user closed the group, or the tab lives in another window.
-    s.groupId = await retryWhileDragging(() => chrome.tabs.group({ tabIds: [tabId], createProperties: { windowId: tab.windowId } }));
+  ensureIdentity(s);
+  await markTab(s, tabId);
+  await withGroupLock(s.id, async () => {
+    const tab = await chrome.tabs.get(tabId);
+    const group = await liveGroup(s);
+    if (group && group.windowId === tab.windowId) {
+      if (tab.groupId !== group.id) await retryWhileDragging(() => chrome.tabs.group({ groupId: group.id, tabIds: [tabId] }));
+      return;
+    }
+    const { groupMode } = await getSettings();
+    if (groupMode === "multi" && !group && s.tabIds.length < 2) {
+      // Opened next to the user's tab, it may have landed inside someone else's group.
+      if (opts.opened && tab.groupId !== -1) await retryWhileDragging(() => chrome.tabs.ungroup(tabId)).catch(() => {});
+      return;
+    }
+    // First (or second, in "multi") tab, the user closed the group, or another window: group
+    // every tab of the thread that lives in this window.
+    const here = (await Promise.all(s.tabIds.map((id) => chrome.tabs.get(id).catch(() => undefined)))).filter((t) => t && t.windowId === tab.windowId).map((t) => t!.id!);
+    s.groupId = await retryWhileDragging(() => chrome.tabs.group({ tabIds: here as [number, ...number[]], createProperties: { windowId: tab.windowId } }));
     await chrome.tabGroups.update(s.groupId, {
       title: groupTitle(s),
-      color: groupColor(s) as `${chrome.tabGroups.Color}`,
+      color: (s.color ?? "purple") as `${chrome.tabGroups.Color}`,
       collapsed: false,
     });
-  }
+  });
   await save();
+}
+
+/** The toolbar badge on the thread's tabs: its number, in its colour. */
+export async function markTab(s: Session, tabId: number): Promise<void> {
+  if (!s.num) return;
+  await chrome.action.setBadgeText({ tabId, text: `#${s.num}` }).catch(() => {});
+  await chrome.action.setBadgeBackgroundColor({ tabId, color: threadColorHex(s) }).catch(() => {});
+  await chrome.action.setBadgeTextColor?.({ tabId, color: threadInk(s) }).catch(() => {});
+}
+
+/** The user recoloured a thread's group in Chrome: that is the thread's colour everywhere now. */
+export async function adoptGroupColor(groupId: number, color: string): Promise<Session | undefined> {
+  await load();
+  const s = [...sessions.values()].find((x) => x.groupId === groupId);
+  if (!s || !isGroupColor(color) || color === s.color) return undefined;
+  s.color = color;
+  await save();
+  // Released meanwhile (its group just went grey on the way out): leave its tabs alone.
+  if (sessions.get(s.id) !== s || s.groupId !== groupId) return undefined;
+  for (const tabId of s.tabIds) await markTab(s, tabId);
+  return s;
+}
+
+export async function unmarkTab(tabId: number): Promise<void> {
+  // null: back to the extension's global badge for this tab.
+  await chrome.action.setBadgeText({ tabId, text: null as unknown as string }).catch(() => {});
+  await chrome.action.setBadgeBackgroundColor({ tabId, color: "#6b7280" }).catch(() => {});
+  await chrome.action.setBadgeTextColor?.({ tabId, color: "#ffffff" }).catch(() => {});
 }
 
 export async function removeTab(tabId: number): Promise<Session | undefined> {
@@ -196,6 +270,7 @@ export async function removeTab(tabId: number): Promise<Session | undefined> {
     const i = s.tabIds.indexOf(tabId);
     if (i >= 0) {
       s.tabIds.splice(i, 1);
+      await unmarkTab(tabId);
       await save();
       return s;
     }
