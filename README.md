@@ -2,6 +2,15 @@
 
 Let [T3 Code](https://github.com/pingdotgg/t3code) agents use your browser.
 
+## What's new
+
+- **No permission prompts.** With the extension installed and connected, agents just open pages, see your web tabs, take one over and upload files. You watch it happen in the tab and press **Esc** to take over.
+- **Tabs land in the thread's tab group.** New tabs open in the background, right inside a group named after the thread, created on demand.
+- **Web pages only.** http and https, localhost included. Browser pages, extension pages, local files and the Chrome Web Store are refused with a clear `[restricted]` error.
+- **A visible agent cursor.** In a tab you're watching, a purple "T3 Code" cursor glides to each element and shows the click or "Typing…" before the real input is sent.
+- **No silent hangs.** Opening a tab can no longer wait on an unseen prompt until the bridge times out.
+- **Self-updating extension.** `npm run reload` builds and makes the connected Chrome load the new extension, no trip to `chrome://extensions`.
+
 It works like the Codex Chrome extension, for every agent T3 Code runs (Claude Code, Codex, Cursor):
 
 - **Your real Chrome, your sign-ins.** An agent works in its own tab group named after the thread, in the background, next to your own tabs. With the extension installed and connected, `browser_open` just opens the page in that group. There are no permission prompts at all.
