@@ -1,6 +1,6 @@
 ---
 name: t3-browser
-description: Use the user's own Chrome (signed in, in a tab group per thread, with their approval) or a separate isolated Chrome to do things on the web for the user, through the t3-browser MCP tools (browser_open, browser_snapshot, browser_click, ...). Use when the user asks you to do something in their browser, on a website, in a web app they are logged into, or to check a page visually.
+description: Use the user's own Chrome (signed in, web pages only, in a tab group per thread) or a separate isolated Chrome to do things on the web for the user, through the t3-browser MCP tools (browser_open, browser_snapshot, browser_click, ...). Use when the user asks you to do something in their browser, on a website, in a web app they are logged into, or to check a page visually.
 ---
 
 # T3 Browser
@@ -9,10 +9,12 @@ The `t3-browser` MCP server gives you two browsers behind one set of `browser_*`
 
 | Browser | When | Notes |
 | --- | --- | --- |
-| `user` (default) | Anything that needs the user's accounts: Gmail, LinkedIn, dashboards, internal tools | The user's real Chrome. Your tabs go into a tab group named after this thread. The user approves each new site once and can press **Esc** to take over at any time. |
-| `isolated` | Public pages, local dev servers, testing, scraping | A clean, separate Chrome run by Vercel's agent-browser. No cookies, no approvals, headless unless `headed: true`. |
+| `user` (default) | Anything that needs the user's accounts: Gmail, LinkedIn, dashboards, internal tools, or a local dev server the user wants to see in their own Chrome | The user's real Chrome. `browser_open` just opens the page, in the background, inside a tab group named after this thread; there is no per-site prompt. Web pages only (http/https, localhost included). The user can press **Esc** to take over at any time. |
+| `isolated` | Public pages, local dev servers, testing, scraping | A clean, separate Chrome run by Vercel's agent-browser. No cookies, headless unless `headed: true`. |
 
 Prefer a real API, CLI or MCP integration over the browser when one exists.
+
+The user browser refuses anything that is not a web page: `chrome://` and other browser pages, `chrome-extension://` pages, `devtools://`, `file://` and the Chrome Web Store. Ask the user to do those steps themselves.
 
 ## Loop
 
@@ -28,7 +30,9 @@ Errors carry a code in brackets:
 - `[covered]`: something (a cookie banner or modal) is on top. Dismiss it, re-snapshot, retry.
 - `[stale_ref]`: take a new snapshot.
 - `[dialog_open]`: answer it with `browser_dialog`.
-- `[denied]` or `[interrupted]`: the user said no or took over. **Stop and ask the user**; do not retry or work around it.
+- `[restricted]`: not a web page (see above). Do not try another way in; ask the user.
+- `[interrupted]`: the user pressed Esc or Stop and took over. **Stop and ask the user**; do not retry or work around it.
+- `[denied]` or `[no_answer]`: the user said no to (or did not answer) a confirmation for listing their tabs, taking over one of their tabs, or uploading files. Stop and ask in chat.
 - `[no_extension]`: the Chrome extension is not connected. Tell the user to open Chrome (setup: `t3-browser doctor`), or use `browser: "isolated"` if their accounts are not needed.
 
 ## Safety
@@ -50,4 +54,4 @@ agent-browser --session t3-user snapshot -i
 agent-browser --session t3-user fill @e3 "hello"
 ```
 
-Approvals, Esc-to-stop and the tab group still apply. The URL contains a local secret: never print it into a web page or share it.
+Web pages only, Esc-to-stop and the tab group still apply. The URL contains a local secret: never print it into a web page or share it.

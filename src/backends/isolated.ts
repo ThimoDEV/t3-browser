@@ -1,5 +1,5 @@
 // "Isolated" browser: a separate, clean Chrome driven by Vercel's agent-browser CLI.
-// No access to the user's cookies or tabs, never needs approval, can run headless.
+// No access to the user's cookies or tabs, can run headless.
 // Each agent thread gets its own agent-browser --session.
 
 import { execFile } from "node:child_process";

@@ -229,6 +229,9 @@ export class Daemon {
     return new Promise((resolve) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
+        // The extension bounds its own waits well below this, so reaching it means Chrome
+        // itself stopped answering (or an old extension build is still loaded).
+        log(`request timed out after ${REQUEST_TIMEOUT_MS / 1000}s`, { method, session: session.id });
         resolve({ type: "response", id, error: { message: `Timed out waiting for Chrome (${method})`, code: "timeout" } });
       }, REQUEST_TIMEOUT_MS);
       this.pending.set(id, { resolve, timer });

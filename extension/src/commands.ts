@@ -8,19 +8,21 @@ import {
   ActionError,
   addTab,
   assertOwnsTab,
+  assertUsableTab,
+  assertWebUrl,
   dropSession,
   ensureMayClaim,
   ensureMayListTabs,
   ensureMayUpload,
-  ensureSiteAllowed,
   getSession,
-  originOf,
-  persist,
+  placeForNewTab,
+  renameSession,
   sessionForTab,
   takeInterrupt,
   type Session,
 } from "./sessions";
 import { formatAXTree, RefAllocator, type AXNode } from "./snapshot";
+import { isWebUrl, normalizeUrl, notWebPageMessage } from "./urls";
 
 type Params = Record<string, any>;
 
@@ -83,6 +85,30 @@ export function forgetTab(tabId: number): void {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+/** Settle with `work`, or reject after `ms`: no Chrome API call may hang a command. */
+async function withDeadline<T>(work: Promise<T>, ms: number, what: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  work.catch(() => {}); // a late rejection after the deadline is not an error
+  try {
+    return await Promise.race([
+      work,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new ActionError(`${what} did not finish within ${ms / 1000}s.`, "timeout")), ms);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function originOf(url: string): string {
+  try {
+    return new URL(url).origin;
+  } catch {
+    return url;
+  }
+}
+
 function tabInfo(tab: chrome.tabs.Tab, s?: Session): TabInfo {
   return {
     tabId: tab.id!,
@@ -108,6 +134,13 @@ async function waitForLoad(tabId: number, timeoutMs = 15_000): Promise<void> {
 }
 
 async function overlay(tabId: number, fn: "show" | "hide" | "pulse" | "agentActing", ...args: unknown[]): Promise<void> {
+  // executeScript waits for the document to become idle, which a slow page (a dev server
+  // compiling its first request) may not reach for a long time. The overlay is shown again
+  // when the page finishes loading, so give up quickly here.
+  await withDeadline(overlayNow(tabId, fn, args), 3_000, "Showing the overlay").catch(() => {});
+}
+
+async function overlayNow(tabId: number, fn: string, args: unknown[]): Promise<void> {
   try {
     if (fn === "show") {
       await chrome.scripting.executeScript({ target: { tabId }, files: ["overlay.js"] });
@@ -133,14 +166,14 @@ export async function hideOverlay(tabId: number): Promise<void> {
   await overlay(tabId, "hide");
 }
 
-/** Common entry for anything that touches a page: ownership, interrupts, approval, debugger. */
+/** Common entry for anything that touches a page: ownership, interrupts, web pages only, debugger. */
 async function prepare(s: Session, tabId: number): Promise<chrome.tabs.Tab> {
   await takeInterrupt(s);
   assertOwnsTab(s, tabId);
   const tab = await chrome.tabs.get(tabId).catch(() => {
     throw new ActionError(`Tab ${tabId} no longer exists.`, "tab_closed");
   });
-  await ensureSiteAllowed(s, tab.url || tab.pendingUrl || "");
+  assertUsableTab(tab);
   const dialog = dialogs.get(tabId);
   if (dialog) {
     throw new ActionError(
@@ -266,21 +299,6 @@ async function afterAction(tabId: number, before: string | undefined) {
   return { ...state, navigated: !!before && state.url !== before };
 }
 
-async function openWindowId(): Promise<number> {
-  const win = await chrome.windows.getLastFocused({ windowTypes: ["normal"] }).catch(() => undefined);
-  if (win?.id !== undefined && win.type === "normal") return win.id;
-  const all = await chrome.windows.getAll({ windowTypes: ["normal"] });
-  if (all[0]?.id !== undefined) return all[0].id;
-  const created = await chrome.windows.create({ focused: false });
-  return created!.id!;
-}
-
-function normalizeUrl(url: string): string {
-  if (/^[a-z][a-z0-9+.-]*:/i.test(url)) return url;
-  if (/^(localhost|127\.0\.0\.1|\[::1\])(:\d+)?(\/|$)/.test(url)) return `http://${url}`;
-  return `https://${url}`;
-}
-
 /**
  * Chrome does not paint background tabs, so a capture there never completes. Try anyway
  * (it works when the tab is visible, e.g. in its own window), then briefly bring the tab to
@@ -310,17 +328,17 @@ async function captureEvenIfHidden(tabId: number, params: Record<string, unknown
 export const handlers: Record<string, (s: Session, p: Params) => Promise<unknown>> = {
   async status(s) {
     const tabs = await Promise.all(s.tabIds.map((id) => chrome.tabs.get(id).catch(() => undefined)));
+    const group = s.groupId === undefined ? undefined : await chrome.tabGroups.get(s.groupId).catch(() => undefined);
     return {
-      session: { id: s.id, title: s.title, groupId: s.groupId },
+      session: { id: s.id, title: s.title, groupId: group?.id, ...(group ? { group: { title: group.title, color: group.color, windowId: group.windowId } } : {}) },
       tabs: tabs.filter(Boolean).map((t) => tabInfo(t!, s)),
       userAgent: navigator.userAgent,
     };
   },
 
   async "session.name"(s, p) {
-    s.title = String(p.title).slice(0, 60);
-    await persist();
-    if (s.groupId !== undefined) await chrome.tabGroups.update(s.groupId, { title: `T3 · ${s.title}` }).catch(() => {});
+    s.named = true;
+    await renameSession(s, String(p.title));
     for (const id of s.tabIds) if (isAttached(id)) await showOverlay(id, s);
     return { title: s.title };
   },
@@ -329,24 +347,38 @@ export const handlers: Record<string, (s: Session, p: Params) => Promise<unknown
     await takeInterrupt(s);
     if (p.scope === "all") {
       await ensureMayListTabs(s);
+      // Only web tabs: browser pages cannot be claimed, so there is no reason to show them.
       const tabs = await chrome.tabs.query({ windowType: "normal" });
-      return tabs.map((t) => tabInfo(t, s));
+      return tabs.filter((t) => isWebUrl(t.url || t.pendingUrl || "")).map((t) => tabInfo(t, s));
     }
     const tabs = await Promise.all(s.tabIds.map((id) => chrome.tabs.get(id).catch(() => undefined)));
     return tabs.filter(Boolean).map((t) => tabInfo(t!, s));
   },
 
+  // No approval step: if the extension is connected, the tab simply opens, inside this
+  // thread's tab group. Every wait below is bounded, so the agent gets an answer well before
+  // the daemon gives up on the call.
   async "tabs.open"(s, p) {
     await takeInterrupt(s);
     const url = normalizeUrl(String(p.url ?? "about:blank"));
-    await ensureSiteAllowed(s, url);
-    const windowId = await openWindowId();
-    const tab = await chrome.tabs.create({ url, active: !!p.active, windowId });
-    await addTab(s, tab.id!);
-    await waitForLoad(tab.id!).catch(() => {});
-    await attach(tab.id!);
-    await showOverlay(tab.id!, s);
-    return tabInfo(await chrome.tabs.get(tab.id!), s);
+    assertWebUrl(url);
+    const active = !!p.active;
+    const { windowId, index } = await placeForNewTab(s);
+    const tab = await chrome.tabs.create({ url, active, windowId, ...(index !== undefined ? { index } : {}) });
+    const tabId = tab.id!;
+    await addTab(s, tabId);
+    if (active) {
+      await chrome.windows.update(windowId, { focused: true }).catch(() => {});
+      if (s.groupId !== undefined) await chrome.tabGroups.update(s.groupId, { collapsed: false }).catch(() => {});
+    }
+    await waitForLoad(tabId, 15_000).catch(() => {});
+    // Attaching now lets the agent act at once. A failure is not fatal: the first action
+    // attaches again and reports a precise error.
+    await attach(tabId).catch(() => {});
+    if (isAttached(tabId)) await showOverlay(tabId, s);
+    const now = await chrome.tabs.get(tabId);
+    assertUsableTab(now);
+    return tabInfo(now, s);
   },
 
   async "tabs.claim"(s, p) {
@@ -357,7 +389,9 @@ export const handlers: Record<string, (s: Session, p: Params) => Promise<unknown
     });
     const owner = await sessionForTab(tabId);
     if (owner && owner.id !== s.id) throw new ActionError("Another T3 thread is already using that tab.", "ownership_conflict");
-    await ensureMayClaim(s, tab);
+    const url = tab.url || tab.pendingUrl || "";
+    if (!isWebUrl(url)) throw new ActionError(notWebPageMessage(url), "restricted");
+    if (!owner) await ensureMayClaim(s, tab);
     await addTab(s, tabId);
     await attach(tabId);
     await showOverlay(tabId, s);
@@ -377,7 +411,7 @@ export const handlers: Record<string, (s: Session, p: Params) => Promise<unknown
     const action = p.action ?? "goto";
     if (action === "goto") {
       const url = normalizeUrl(String(p.url));
-      await ensureSiteAllowed(s, url);
+      assertWebUrl(url);
       await chrome.tabs.update(tabId, { url });
     } else if (action === "back") await chrome.tabs.goBack(tabId);
     else if (action === "forward") await chrome.tabs.goForward(tabId);
@@ -385,9 +419,8 @@ export const handlers: Record<string, (s: Session, p: Params) => Promise<unknown
     else throw new ActionError(`Unknown navigation action "${action}".`);
     onTabNavigated(tabId);
     await waitForLoad(tabId);
-    const tab = await chrome.tabs.get(tabId);
-    // A redirect can land somewhere the user has not approved yet.
-    await ensureSiteAllowed(s, tab.url ?? "");
+    // Going back can leave the web (e.g. to a browser page the tab showed earlier).
+    assertUsableTab(await chrome.tabs.get(tabId));
     return pageState(tabId);
   },
 
@@ -715,7 +748,7 @@ export const handlers: Record<string, (s: Session, p: Params) => Promise<unknown
     await takeInterrupt(s);
     assertOwnsTab(s, tabId);
     const method = String(p.method);
-    if (method === "Page.navigate" && p.params?.url) await ensureSiteAllowed(s, String(p.params.url));
+    if (method === "Page.navigate" && p.params?.url) assertWebUrl(String(p.params.url));
     if (method === "DOM.setFileInputFiles") await ensureMayUpload(s, originOf((await chrome.tabs.get(tabId)).url ?? ""), p.params?.files ?? []);
     if (!isAttached(tabId)) await attach(tabId);
     try {

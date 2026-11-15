@@ -1,16 +1,21 @@
-// Per-thread state: which tabs belong to which agent thread, its tab group, site approvals
-// and interruptions. Persisted in chrome.storage.session so a service-worker restart does
-// not forget which tabs an agent owns.
+// Per-thread state: which tabs belong to which agent thread, its tab group, and
+// interruptions. Persisted in chrome.storage.session so a service-worker restart does not
+// forget which tabs an agent owns.
+//
+// There is no per-site approval: if the extension is installed and connected, agents may
+// use any web page (http/https) in their own tab group. Browser pages are refused outright
+// (see urls.ts). The user can still press Esc or Stop at any time to take control back.
 
 import type { SessionInfo } from "../../src/protocol";
+import { isUsableTabUrl, isWebUrl, notWebPageMessage } from "./urls";
 
 export interface Session {
   id: string;
   title: string;
+  /** Set by browser_name_session; from then on the default title from the MCP env is ignored. */
+  named?: boolean;
   groupId?: number;
   tabIds: number[];
-  /** Origins approved "for this thread only". */
-  allowedOrigins: string[];
   /** The user has allowed this thread to list all their open tabs. */
   mayListAllTabs?: boolean;
   /** Set by Esc / Stop; reported to the agent once, then cleared. */
@@ -19,14 +24,10 @@ export interface Session {
 }
 
 export interface Settings {
-  /** "ask": approve each new site. "trusted": never ask (still blocks restricted pages). */
-  approvalMode: "ask" | "trusted";
-  /** Sites approved for every thread. */
-  alwaysAllowed: string[];
   port: number;
 }
 
-export const DEFAULT_SETTINGS: Settings = { approvalMode: "ask", alwaysAllowed: [], port: 47823 };
+export const DEFAULT_SETTINGS: Settings = { port: 47823 };
 
 type GroupColor = "grey" | "blue" | "red" | "yellow" | "green" | "pink" | "purple" | "cyan" | "orange";
 const GROUP_COLORS: GroupColor[] = ["purple", "blue", "cyan", "green", "orange", "pink", "yellow", "red"];
@@ -57,12 +58,15 @@ async function save(): Promise<void> {
 
 export async function getSettings(): Promise<Settings> {
   const v = await chrome.storage.local.get("settings");
-  return { ...DEFAULT_SETTINGS, ...(v.settings as Partial<Settings> | undefined) };
+  const stored = (v.settings ?? {}) as Partial<Settings>;
+  return { port: typeof stored.port === "number" ? stored.port : DEFAULT_SETTINGS.port };
 }
 
 export async function updateSettings(patch: Partial<Settings>): Promise<Settings> {
-  const next = { ...(await getSettings()), ...patch };
-  await chrome.storage.local.set({ settings: next });
+  // Only known keys are written, which also drops settings from older versions
+  // (the site allow-list and "trusted" mode).
+  const next: Settings = { ...(await getSettings()), ...patch };
+  await chrome.storage.local.set({ settings: { port: next.port } });
   return next;
 }
 
@@ -75,15 +79,19 @@ export async function getSession(info: SessionInfo): Promise<Session> {
   await load();
   let s = sessions.get(info.id);
   if (!s) {
-    s = { id: info.id, title: info.title || "Agent", tabIds: [], allowedOrigins: [], createdAt: Date.now() };
+    s = { id: info.id, title: info.title || "Agent", tabIds: [], createdAt: Date.now() };
     sessions.set(s.id, s);
     await save();
-  } else if (info.title && info.title !== info.id && info.title !== s.title) {
-    s.title = info.title;
-    await save();
-    if (s.groupId !== undefined) await chrome.tabGroups.update(s.groupId, { title: groupTitle(s) }).catch(() => {});
+  } else if (!s.named && info.title && info.title !== info.id && info.title !== s.title) {
+    await renameSession(s, info.title);
   }
   return s;
+}
+
+export async function renameSession(s: Session, title: string): Promise<void> {
+  s.title = title.slice(0, 60);
+  await save();
+  if (s.groupId !== undefined) await chrome.tabGroups.update(s.groupId, { title: groupTitle(s) }).catch(() => {});
 }
 
 export async function sessionForTab(tabId: number): Promise<Session | undefined> {
@@ -102,33 +110,69 @@ export async function dropSession(id: string): Promise<void> {
   await save();
 }
 
-function groupTitle(s: Session): string {
+export function groupTitle(s: Session): string {
   const t = s.title.length > 28 ? s.title.slice(0, 27) + "…" : s.title;
   return `T3 · ${t}`;
 }
 
-/** Put a tab into the session's tab group, creating the group if needed. */
+/** Same thread, same colour, across service-worker restarts and new groups. */
+function groupColor(s: Session): GroupColor {
+  let h = 0;
+  for (const ch of s.id) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
+  return GROUP_COLORS[h % GROUP_COLORS.length];
+}
+
+async function liveGroup(s: Session): Promise<chrome.tabGroups.TabGroup | undefined> {
+  if (s.groupId === undefined) return undefined;
+  const group = await chrome.tabGroups.get(s.groupId).catch(() => undefined);
+  if (!group) s.groupId = undefined;
+  return group;
+}
+
+/**
+ * Where a new tab for this thread goes: right after the last tab of the thread's group, in
+ * the group's window, so it appears inside the group instead of flashing at the end of the
+ * strip. Without a group: the window the user last used.
+ */
+export async function placeForNewTab(s: Session): Promise<{ windowId: number; index?: number }> {
+  const group = await liveGroup(s);
+  if (group) {
+    const inGroup = await chrome.tabs.query({ groupId: group.id });
+    if (inGroup.length) return { windowId: group.windowId, index: Math.max(...inGroup.map((t) => t.index)) + 1 };
+  }
+  const win = await chrome.windows.getLastFocused({ windowTypes: ["normal"] }).catch(() => undefined);
+  if (win?.id !== undefined && win.type === "normal") return { windowId: win.id };
+  const all = await chrome.windows.getAll({ windowTypes: ["normal"] });
+  if (all[0]?.id !== undefined) return { windowId: all[0].id };
+  const created = await chrome.windows.create({ focused: false });
+  return { windowId: created!.id! };
+}
+
+/** Chrome refuses tab edits while the user drags a tab; that lasts a moment. */
+async function retryWhileDragging<T>(fn: () => Promise<T>): Promise<T> {
+  for (let i = 0; ; i++) {
+    try {
+      return await fn();
+    } catch (err) {
+      if (i >= 10 || !/cannot be edited right now/i.test(String((err as Error).message ?? err))) throw err;
+      await new Promise((r) => setTimeout(r, 200));
+    }
+  }
+}
+
+/** Put a tab into the session's tab group, creating the group (named after the thread) if needed. */
 export async function addTab(s: Session, tabId: number): Promise<void> {
   if (!s.tabIds.includes(tabId)) s.tabIds.push(tabId);
   const tab = await chrome.tabs.get(tabId);
-  let groupOk = false;
-  if (s.groupId !== undefined) {
-    try {
-      const group = await chrome.tabGroups.get(s.groupId);
-      if (group.windowId === tab.windowId) {
-        await chrome.tabs.group({ groupId: s.groupId, tabIds: [tabId] });
-        groupOk = true;
-      }
-    } catch {
-      s.groupId = undefined;
-    }
-  }
-  if (!groupOk) {
-    s.groupId = await chrome.tabs.group({ tabIds: [tabId], createProperties: { windowId: tab.windowId } });
-    const index = [...sessions.keys()].indexOf(s.id);
+  const group = await liveGroup(s);
+  if (group && group.windowId === tab.windowId) {
+    if (tab.groupId !== group.id) await retryWhileDragging(() => chrome.tabs.group({ groupId: group.id, tabIds: [tabId] }));
+  } else {
+    // First tab, the user closed the group, or the tab lives in another window.
+    s.groupId = await retryWhileDragging(() => chrome.tabs.group({ tabIds: [tabId], createProperties: { windowId: tab.windowId } }));
     await chrome.tabGroups.update(s.groupId, {
       title: groupTitle(s),
-      color: GROUP_COLORS[Math.max(0, index) % GROUP_COLORS.length] as `${chrome.tabGroups.Color}`,
+      color: groupColor(s) as `${chrome.tabGroups.Color}`,
       collapsed: false,
     });
   }
@@ -175,43 +219,40 @@ export async function markInterrupted(s: Session, reason: string): Promise<void>
 }
 
 // ---------------------------------------------------------------------------------------
-// Site approvals
+// Web pages only
 
-const RESTRICTED = /^(chrome|chrome-extension|chrome-untrusted|edge|brave|opera|vivaldi|devtools|view-source|about):/i;
-const RESTRICTED_HOSTS = ["chromewebstore.google.com", "chrome.google.com"];
-
-export function originOf(url: string): string {
-  try {
-    const u = new URL(url);
-    if (u.protocol === "file:") return "file://";
-    return u.origin;
-  } catch {
-    return url;
-  }
+/** Throws unless `url` is a web page an agent may open or navigate to. */
+export function assertWebUrl(url: string): void {
+  if (!isWebUrl(url) && url !== "about:blank") throw new ActionError(notWebPageMessage(url), "restricted");
 }
 
-export function isRestricted(url: string): boolean {
-  if (!url || url === "about:blank") return false;
-  if (RESTRICTED.test(url)) return true;
-  try {
-    const u = new URL(url);
-    return RESTRICTED_HOSTS.includes(u.hostname) && (u.hostname !== "chrome.google.com" || u.pathname.startsWith("/webstore"));
-  } catch {
-    return false;
-  }
+/** Throws unless an owned tab currently shows a web page (or is still blank). */
+export function assertUsableTab(tab: chrome.tabs.Tab): void {
+  const url = tab.url || tab.pendingUrl || "";
+  if (!isUsableTabUrl(url)) throw new ActionError(notWebPageMessage(url), "restricted");
 }
+
+// ---------------------------------------------------------------------------------------
+// Confirmations that remain: listing all the user's tabs, taking over a tab the user opened,
+// and uploading local files. (Sites themselves need no approval.)
 
 export interface ApprovalRequest {
   id: string;
   sessionTitle: string;
-  kind: "site" | "tabs" | "upload" | "claim";
+  kind: "tabs" | "upload" | "claim";
   origin?: string;
   detail?: string;
 }
 
-type Decision = "once" | "always" | "deny";
+type Decision = "once" | "deny" | "timeout";
 const pendingApprovals = new Map<string, { req: ApprovalRequest; resolve: (d: Decision) => void; windowId?: number }>();
 const approvalDedup = new Map<string, Promise<Decision>>();
+
+/**
+ * How long a prompt waits for the user. Must stay well below the daemon's request timeout
+ * (120s) so the agent gets a clear answer instead of "Timed out waiting for Chrome".
+ */
+const APPROVAL_TIMEOUT_MS = 90_000;
 
 export function getApproval(id: string): ApprovalRequest | undefined {
   return pendingApprovals.get(id)?.req;
@@ -238,6 +279,8 @@ async function askUser(req: Omit<ApprovalRequest, "id">, dedupKey: string): Prom
   });
   approvalDedup.set(dedupKey, promise);
   promise.finally(() => approvalDedup.delete(dedupKey));
+  const timeout = setTimeout(() => resolveApproval(id, "timeout"), APPROVAL_TIMEOUT_MS);
+  promise.finally(() => clearTimeout(timeout));
 
   const last = await chrome.windows.getLastFocused().catch(() => undefined);
   const width = 440;
@@ -251,65 +294,49 @@ async function askUser(req: Omit<ApprovalRequest, "id">, dedupKey: string): Prom
       left: last?.left !== undefined && last.width ? Math.max(0, last.left + last.width - width - 24) : undefined,
       top: last?.top !== undefined ? Math.max(0, last.top + 80) : undefined,
     })
-    .catch(() => chrome.windows.create(base));
+    .catch(() => chrome.windows.create(base).catch(() => undefined));
+  if (win?.id === undefined) {
+    resolveApproval(id, "deny");
+    return promise;
+  }
   const p = pendingApprovals.get(id);
-  if (p) p.windowId = win?.id;
-
-  // Unanswered prompts count as "no" so the agent is never stuck forever.
-  const timeout = setTimeout(() => resolveApproval(id, "deny"), 5 * 60_000);
-  promise.finally(() => clearTimeout(timeout));
+  if (p) p.windowId = win.id;
+  // When another app has focus (e.g. T3 Code), Windows will not raise the prompt; at least
+  // flash it in the taskbar.
+  chrome.windows.update(win.id, { focused: true, drawAttention: true }).catch(() => {});
   return promise;
 }
 
-/** Throws unless the user (or settings) allow this thread to act on `url`. */
-export async function ensureSiteAllowed(s: Session, url: string): Promise<void> {
-  if (!url || url === "about:blank" || url.startsWith("data:")) return;
-  if (isRestricted(url)) {
-    throw new ActionError(`Chrome does not let extensions control ${originOf(url)} pages.`, "restricted");
+function refusal(d: Decision, what: string): ActionError | undefined {
+  if (d === "timeout") {
+    return new ActionError(
+      `The user did not answer the T3 Browser prompt (${what}) within ${APPROVAL_TIMEOUT_MS / 1000}s. Ask the user in chat, then try again.`,
+      "no_answer",
+    );
   }
-  const origin = originOf(url);
-  const settings = await getSettings();
-  if (settings.approvalMode === "trusted") return;
-  if (settings.alwaysAllowed.includes(origin) || s.allowedOrigins.includes(origin)) return;
-
-  const decision = await askUser({ sessionTitle: s.title, kind: "site", origin }, `site:${s.id}:${origin}`);
-  if (decision === "deny") {
-    throw new ActionError(`The user did not allow this thread to use ${origin}.`, "denied");
-  }
-  if (decision === "always") {
-    const fresh = await getSettings();
-    if (!fresh.alwaysAllowed.includes(origin)) await updateSettings({ alwaysAllowed: [...fresh.alwaysAllowed, origin] });
-  }
-  if (!s.allowedOrigins.includes(origin)) s.allowedOrigins.push(origin);
-  await save();
+  if (d === "deny") return new ActionError(`The user said no (${what}).`, "denied");
+  return undefined;
 }
 
 export async function ensureMayListTabs(s: Session): Promise<void> {
-  if (s.mayListAllTabs || (await getSettings()).approvalMode === "trusted") return;
-  const d = await askUser({ sessionTitle: s.title, kind: "tabs" }, `tabs:${s.id}`);
-  if (d === "deny") throw new ActionError("The user did not allow this thread to see their open tabs.", "denied");
+  if (s.mayListAllTabs) return;
+  const e = refusal(await askUser({ sessionTitle: s.title, kind: "tabs" }, `tabs:${s.id}`), "seeing their open tabs");
+  if (e) throw e;
   s.mayListAllTabs = true;
   await save();
 }
 
 export async function ensureMayClaim(s: Session, tab: chrome.tabs.Tab): Promise<void> {
-  if ((await getSettings()).approvalMode !== "trusted") {
-    const d = await askUser(
-      { sessionTitle: s.title, kind: "claim", origin: originOf(tab.url ?? ""), detail: tab.title },
-      `claim:${s.id}:${tab.id}`,
-    );
-    if (d === "deny") throw new ActionError("The user did not hand over that tab.", "denied");
-  }
-  const origin = originOf(tab.url ?? "");
-  if (!s.allowedOrigins.includes(origin)) s.allowedOrigins.push(origin);
-  await save();
+  const d = await askUser(
+    { sessionTitle: s.title, kind: "claim", origin: new URL(tab.url!).origin, detail: tab.title },
+    `claim:${s.id}:${tab.id}`,
+  );
+  const e = refusal(d, "handing over that tab");
+  if (e) throw e;
 }
 
 export async function ensureMayUpload(s: Session, origin: string, files: string[]): Promise<void> {
-  if ((await getSettings()).approvalMode === "trusted") return;
-  const d = await askUser(
-    { sessionTitle: s.title, kind: "upload", origin, detail: files.join("\n") },
-    `upload:${s.id}:${files.join("|")}`,
-  );
-  if (d === "deny") throw new ActionError("The user did not allow uploading those files.", "denied");
+  const d = await askUser({ sessionTitle: s.title, kind: "upload", origin, detail: files.join("\n") }, `upload:${s.id}:${files.join("|")}`);
+  const e = refusal(d, "uploading those files");
+  if (e) throw e;
 }

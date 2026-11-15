@@ -1,6 +1,7 @@
 // End-to-end: real Chrome for Testing + the built extension + the daemon + the MCP server,
-// driven through an MCP client exactly like an agent would. Approval popups are answered by
-// this script over a separate DevTools connection, playing the role of the user.
+// driven through an MCP client exactly like an agent would. The prompts that remain (listing
+// all tabs, claiming, uploads) are answered by this script over a separate DevTools
+// connection, playing the role of the user. Opening sites never prompts.
 //
 //   npx @puppeteer/browsers install chrome@stable --path .cache/browsers
 //   npm run test:e2e            (HEADED=1 to watch)
@@ -75,6 +76,7 @@ class Cdp {
     const { sessionId } = await this.send("Target.attachToTarget", { targetId, flatten: true });
     try {
       const r = await this.send("Runtime.evaluate", { expression, returnByValue: true, awaitPromise: true }, sessionId);
+      if (r.exceptionDetails) throw new Error(r.exceptionDetails.exception?.description ?? r.exceptionDetails.text);
       return r.result.value;
     } finally {
       await this.send("Target.detachFromTarget", { sessionId }).catch(() => {});
@@ -176,6 +178,15 @@ async function call(name, args = {}) {
   return { ...r, text, json: (() => { try { return JSON.parse(text); } catch { return undefined; } })() };
 }
 
+/** Ask the extension's service worker, e.g. for a tab's group. */
+async function inExtension(expression) {
+  const { targetInfos } = await user.send("Target.getTargets");
+  const sw = targetInfos.find((t) => t.type === "service_worker" && t.url.endsWith("/background.js"));
+  assert.ok(sw, "extension service worker not found");
+  return user.evalIn(sw.targetId, expression);
+}
+const groupOf = (tabId) => inExtension(`chrome.tabs.get(${tabId}).then(t => t.groupId)`);
+
 const refOf = (snapshot, pattern) => {
   const line = snapshot.split("\n").find((l) => pattern.test(l));
   const m = line && /\[ref=(e\d+)\]/.exec(line);
@@ -206,13 +217,40 @@ await step("name session", async () => {
   await call("browser_name_session", { title: "Signup test" });
 });
 
-await step("open asks for approval, then opens the tab in a group", async () => {
+await step("open needs no approval and lands in the thread's tab group", async () => {
   const r = await call("browser_open", { url: `${site}/form.html` });
   tab = r.json.tab;
   assert.equal(r.json.title, "Signup form");
-  assert.ok(approvalsSeen.some((a) => a.title.includes("127.0.0.1")), JSON.stringify(approvalsSeen));
-  const { targetInfos } = await user.send("Target.getTargets");
-  assert.ok(targetInfos.some((t) => t.url.includes("/form.html")));
+  assert.deepEqual(approvalsSeen, [], "opening a site must not prompt");
+  const status = (await call("browser_status")).json;
+  const groupId = status.user.session.groupId;
+  assert.ok(groupId >= 0, JSON.stringify(status.user.session));
+  assert.equal(await groupOf(tab), groupId, "tab is in the thread group");
+  assert.equal(status.user.session.group.title, "T3 · Signup test", "group is named after the thread");
+});
+
+await step("a second tab joins the same group, right after the first", async () => {
+  const r = await call("browser_open", { url: `${otherOrigin}/page2.html` });
+  assert.deepEqual(approvalsSeen, [], "a new origin must not prompt either");
+  assert.equal(await groupOf(r.json.tab), await groupOf(tab));
+  const [a, b] = await inExtension(`Promise.all([chrome.tabs.get(${tab}), chrome.tabs.get(${r.json.tab})]).then(ts => ts.map(t => t.index))`);
+  assert.equal(b, a + 1);
+  await call("browser_close_tab", { tab: r.json.tab });
+});
+
+await step("bare localhost addresses open over http", async () => {
+  const r = await call("browser_open", { url: `localhost:${fixtures.address().port}/page2.html` });
+  assert.equal(r.json.url, `${otherOrigin}/page2.html`);
+  await call("browser_close_tab", { tab: r.json.tab });
+});
+
+await step("non-web pages are refused with a clear error", async () => {
+  for (const url of ["chrome://settings", "chrome-extension://doaacelnfjdbbfhhkglnkdgboeajnlhk/popup.html", "file:///etc/hosts", "https://chromewebstore.google.com/"]) {
+    await assert.rejects(call("browser_open", { url }), /\[restricted\].*only works with web pages/, url);
+  }
+  await assert.rejects(call("browser_navigate", { tab, url: "chrome://version" }), /\[restricted\]/);
+  const mine = (await call("browser_tabs")).json;
+  assert.ok(mine.every((t) => !String(t.url).startsWith("chrome")), JSON.stringify(mine));
 });
 
 await step("snapshot has refs, roles, iframe content", async () => {
@@ -295,10 +333,17 @@ await step("stale refs are rejected", async () => {
   await assert.rejects(call("browser_click", { tab, ref: "e999" }), /stale_ref|Unknown ref/);
 });
 
-await step("denied site stops the agent", async () => {
-  policy = (title) => (title.includes("localhost") ? "deny" : "once");
-  await assert.rejects(call("browser_navigate", { tab, url: `${otherOrigin}/page2.html` }), /denied|did not allow/);
-  policy = () => "once";
+await step("navigating to another origin just works", async () => {
+  const r = await call("browser_navigate", { tab, url: `${otherOrigin}/page2.html` });
+  assert.equal(r.json.url, `${otherOrigin}/page2.html`);
+  assert.deepEqual(approvalsSeen, []);
+});
+
+await step("listing all tabs shows web tabs only", async () => {
+  await user.send("Target.createTarget", { url: "chrome://version" });
+  const all = (await call("browser_tabs", { scope: "all" })).json;
+  assert.ok(approvalsSeen.some((a) => /open tabs/.test(a.title)), JSON.stringify(approvalsSeen));
+  assert.ok(all.length > 0 && all.every((t) => /^https?:/.test(t.url)), JSON.stringify(all));
 });
 
 await step("links opening a new tab join the thread", async () => {

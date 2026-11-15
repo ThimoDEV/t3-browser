@@ -52,23 +52,9 @@ async function render() {
   }
   $("#no-sessions").hidden = state.sessions.length > 0;
   $("#stop-all").hidden = !state.sessions.some((s) => s.tabs.some((t) => t.controlled));
-
-  $<HTMLInputElement>("#trusted").checked = state.settings.approvalMode === "trusted";
-  const origins = $("#origins");
-  origins.replaceChildren();
-  for (const o of state.settings.alwaysAllowed) {
-    const remove = el("button", { class: "ghost small", title: "Ask again next time" }, "Remove");
-    remove.addEventListener("click", () =>
-      action({ action: "settings", patch: { alwaysAllowed: state.settings.alwaysAllowed.filter((x) => x !== o) } }),
-    );
-    origins.append(el("li", { class: "row-head" }, el("span", {}, o.replace(/^https?:\/\//, "")), remove));
-  }
 }
 
 $("#stop-all").addEventListener("click", () => action({ action: "stop-all" }));
-$<HTMLInputElement>("#trusted").addEventListener("change", (e) =>
-  action({ action: "settings", patch: { approvalMode: (e.target as HTMLInputElement).checked ? "trusted" : "ask" } }),
-);
 
 render();
 setInterval(render, 2000);

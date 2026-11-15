@@ -27,7 +27,7 @@ export interface TabInfo {
 
 export interface RpcError {
   message: string;
-  /** Machine-readable reason, e.g. "interrupted", "denied", "no_extension". */
+  /** Machine-readable reason, e.g. "interrupted", "restricted", "denied", "no_answer", "no_extension". */
   code?: string;
 }
 

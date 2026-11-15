@@ -10,7 +10,6 @@ import {
   allSessions,
   getApproval,
   getSettings,
-  isRestricted,
   markInterrupted,
   removeTab,
   resolveApproval,
@@ -19,6 +18,7 @@ import {
   updateSettings,
   type Session,
 } from "./sessions";
+import { isUsableTabUrl } from "./urls";
 
 const OFFSCREEN_URL = "offscreen.html";
 let transportConnected = false;
@@ -177,7 +177,8 @@ async function adoptChildTab(tabId: number, sourceTabId: number): Promise<void> 
   const s = await sessionForTab(sourceTabId);
   if (!s || s.tabIds.includes(tabId)) return;
   const tab = await chrome.tabs.get(tabId).catch(() => undefined);
-  if (!tab || isRestricted(tab.pendingUrl || tab.url || "")) return;
+  // Web pages only (a fresh popup is still blank, which is fine).
+  if (!tab || !isUsableTabUrl(tab.pendingUrl || tab.url || "")) return;
   await addTab(s, tabId).catch(() => {});
   postEvent({ type: "event", sessionId: s.id, event: "tab.created", data: { tabId, openerTabId: sourceTabId } });
 }

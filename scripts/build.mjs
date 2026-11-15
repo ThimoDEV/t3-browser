@@ -52,7 +52,7 @@ function manifest() {
     name: "T3 Browser",
     short_name: "T3 Browser",
     version: pkg.version,
-    description: "Lets T3 Code agents use your browser: their own tab group, your sign-ins, your approval for every new site.",
+    description: "Lets T3 Code agents use your browser on web pages: in their own tab group, with your sign-ins, and Esc to take over.",
     key,
     minimum_chrome_version: "120",
     background: { service_worker: "background.js" },

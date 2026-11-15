@@ -4,6 +4,7 @@
 type EventListener = (tabId: number, method: string, params: unknown, childSessionId?: string) => void;
 type DetachListener = (tabId: number, reason: string) => void;
 
+const ATTACH_TIMEOUT_MS = 10_000;
 const attached = new Set<number>();
 const attaching = new Map<number, Promise<void>>();
 const eventListeners = new Set<EventListener>();
@@ -38,7 +39,12 @@ export async function attach(tabId: number): Promise<void> {
   if (inFlight) return inFlight;
   const p = (async () => {
     try {
-      await chrome.debugger.attach({ tabId }, "1.3");
+      // Bounded, so a tab that never lets the debugger in cannot hang a command.
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([
+        chrome.debugger.attach({ tabId }, "1.3"),
+        new Promise((_, reject) => (timer = setTimeout(() => reject(new Error("Chrome did not let the debugger attach within 10s")), ATTACH_TIMEOUT_MS))),
+      ]).finally(() => clearTimeout(timer));
     } catch (err) {
       const msg = String((err as Error).message ?? err);
       // Already attached by us in a previous service-worker life: adopt it.

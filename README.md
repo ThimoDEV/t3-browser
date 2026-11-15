@@ -4,10 +4,11 @@ Let [T3 Code](https://github.com/pingdotgg/t3code) agents use your browser.
 
 It works like the Codex Chrome extension, for every agent T3 Code runs (Claude Code, Codex, Cursor):
 
-- **Your real Chrome, your sign-ins.** An agent works in its own tab group named after the thread, in the background, next to your own tabs.
-- **You stay in charge.** You approve each new site once ("for this thread" or "always"). Pressing **Esc** on a controlled tab, or clicking **Stop**, hands control straight back, and the agent is told to stop and ask you.
-- **Plus a clean browser.** For public pages and local dev servers, agents can use an isolated Chrome driven by Vercel's [agent-browser](https://github.com/vercel-labs/agent-browser). It has no cookies and needs no approvals.
-- **agent-browser on your real tabs.** The bridge exposes a CDP endpoint scoped to the thread's tab group, so `agent-browser connect` (or Playwright) can drive your signed-in tabs, with the same approvals.
+- **Your real Chrome, your sign-ins.** An agent works in its own tab group named after the thread, in the background, next to your own tabs. With the extension installed and connected, `browser_open` just opens the page in that group: no per-site prompt.
+- **Web pages only.** Agents get http and https pages (localhost included). Browser pages (`chrome://`, `chrome-extension://`, `devtools://`), local files and the Chrome Web Store are refused.
+- **You stay in charge.** Pressing **Esc** on a controlled tab, or clicking **Stop**, hands control straight back, and the agent is told to stop and ask you.
+- **Plus a clean browser.** For public pages and local dev servers, agents can use an isolated Chrome driven by Vercel's [agent-browser](https://github.com/vercel-labs/agent-browser). It has no cookies.
+- **agent-browser on your real tabs.** The bridge exposes a CDP endpoint scoped to the thread's tab group, so `agent-browser connect` (or Playwright) can drive your signed-in tabs, with the same limits.
 
 ```
 T3 Code thread ─▶ Claude Code / Codex / Cursor
@@ -39,7 +40,9 @@ Then load the extension once:
 
 1. Open `chrome://extensions` and turn on **Developer mode**.
 2. Click **Load unpacked** and pick the `extension/dist` folder (`node dist/cli.js extension-path` prints it).
-3. Pin **T3 Browser** to the toolbar. Its popup shows connection status, which threads are active, a **Stop** button, and the sites you've allowed.
+3. Pin **T3 Browser** to the toolbar. Its popup shows connection status, which threads are active, and a **Stop** button.
+
+After pulling a new version, run `npm run build` and click the reload icon on the T3 Browser card in `chrome://extensions`.
 
 Start a **new** thread in T3 Code (MCP servers load when a session starts) and ask something like *"check my GitHub notifications and summarise the ones about t3code"*.
 
@@ -49,7 +52,7 @@ Start a **new** thread in T3 Code (MCP servers load when a session starts) and a
 
 | Tool | Does |
 | --- | --- |
-| `browser_open` | New tab in the user's Chrome (default) or `browser: "isolated"` |
+| `browser_open` | New tab in the thread's tab group in the user's Chrome (default), or `browser: "isolated"` |
 | `browser_tabs` / `browser_claim_tab` | List this thread's tabs, or all of the user's (asks first) and take one over (asks first) |
 | `browser_snapshot` | Accessibility tree with refs: `- button "Send" [ref=e6]`; `interactive: true` for a flat short list; includes same-process iframes |
 | `browser_click` / `browser_type` / `browser_press` / `browser_select` / `browser_hover` / `browser_scroll` | Real input events through CDP. Clicks fail with `[covered]` instead of mis-clicking under a modal |
@@ -66,10 +69,9 @@ The server also sends usage and safety instructions in its MCP `initialize` resp
 - The daemon binds `127.0.0.1` only.
 - The browser side accepts exactly one Origin: `chrome-extension://doaacelnfjdbbfhhkglnkdgboeajnlhk`. The ID is pinned by the public key in the manifest, and web pages cannot forge that Origin.
 - Local clients (the MCP server, CDP clients) need the random token in `~/.t3-browser/token`, and any connection that carries a web Origin is refused even if it has the token. A page that finds the port still can't drive the browser.
-- The extension refuses browser-internal pages and the Web Store. It asks before each new origin, before listing your tabs, before taking over a tab, and before uploading files. "Always allow" lives in the popup, where you can revoke it.
+- The extension only works on web pages (http/https). It refuses browser-internal pages, extension pages, local files and the Web Store, for opening, navigating, acting and claiming alike. Sites need no approval; it still asks before listing your tabs, before taking over a tab you opened, and before uploading files. Those prompts give up after 90 seconds with a clear `[no_answer]`, so an unseen prompt never hangs the agent.
 - Agents only touch tabs in their own group. Another thread's tab is off limits (`[ownership_conflict]`).
 - The agent instructions treat page content as untrusted, and agents must confirm in chat before sending, buying, deleting or changing account settings.
-- Turning on "Let agents use any site without asking" in the popup skips the site prompts. Esc and Stop still work.
 
 ## How it compares
 
@@ -91,7 +93,7 @@ npx @puppeteer/browsers install chrome@stable --path .cache/browsers
 npm run test:e2e     # real Chrome for Testing + extension + daemon + MCP, end to end (HEADED=1 to watch)
 ```
 
-The e2e suite runs the whole chain through an MCP client and plays the user by answering the approval windows. It covers approvals and denials, Esc takeover, dialogs, iframes, covered elements, background-tab screenshots, new-tab adoption, the agent-browser CDP relay and the isolated browser.
+The e2e suite runs the whole chain through an MCP client and plays the user by answering the remaining prompts. It covers opening without a site prompt into the thread's tab group, refusing non-web pages, Esc takeover, dialogs, iframes, covered elements, background-tab screenshots, new-tab adoption, the agent-browser CDP relay and the isolated browser.
 
 Environment: `T3_BROWSER_PORT` (default 47823, change the extension's port in its storage too), `T3_BROWSER_HOME` (default `~/.t3-browser`), `T3_BROWSER_SESSION_ID` / `T3_BROWSER_SESSION_TITLE` (default: `T3CODE_THREAD_ID` and the project folder name), `T3_BROWSER_DEBUG=1`.
 
