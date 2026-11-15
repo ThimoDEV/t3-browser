@@ -408,6 +408,24 @@ await step("isolated browser via agent-browser", async () => {
   assert.ok(shot.content.some((c) => c.type === "image"));
 });
 
+await step("in a visible tab the cursor animates, and input still lands", async () => {
+  const r = await call("browser_open", { url: `${site}/form.html`, focus: true });
+  const t = r.json.tab;
+  assert.equal(await inExtension(`chrome.tabs.get(${t}).then(x => x.active)`), true);
+  const s = (await call("browser_snapshot", { tab: t })).text;
+  const started = Date.now();
+  await call("browser_type", { tab: t, ref: refOf(s, /textbox "Name"/), text: "Cursor" });
+  await call("browser_select", { tab: t, ref: refOf(s, /combobox "Country"/), values: ["Belgium"] });
+  await call("browser_click", { tab: t, ref: refOf(s, /checkbox "I agree"/) });
+  await call("browser_click", { tab: t, ref: refOf(s, /button "Send"/) });
+  const elapsed = Date.now() - started;
+  const out = await call("browser_read", { tab: t, selector: "#out" });
+  assert.equal(out.json.text, "Hello Cursor from be (agreed)");
+  // Each glide is capped well under a second; four actions must not crawl.
+  assert.ok(elapsed < 8000, `four animated actions took ${elapsed}ms`);
+  await call("browser_close_tab", { tab: t });
+});
+
 await step("browser_done keeps chosen tabs and closes the rest", async () => {
   const before = (await call("browser_tabs")).json.filter((t) => t.browser === "user");
   await call("browser_done", { keepTabs: [tab] });

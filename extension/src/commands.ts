@@ -77,6 +77,7 @@ async function unlessDialog<T>(tabId: number, work: Promise<T>): Promise<T | und
 
 export function forgetTab(tabId: number): void {
   refAllocators.delete(tabId);
+  pointers.delete(tabId);
   dialogs.delete(tabId);
 }
 
@@ -133,7 +134,9 @@ async function waitForLoad(tabId: number, timeoutMs = 15_000): Promise<void> {
   }
 }
 
-async function overlay(tabId: number, fn: "show" | "hide" | "pulse" | "agentActing", ...args: unknown[]): Promise<void> {
+type OverlayFn = "show" | "hide" | "moveTo" | "click" | "activity" | "agentActing";
+
+async function overlay(tabId: number, fn: OverlayFn, ...args: unknown[]): Promise<void> {
   // executeScript waits for the document to become idle, which a slow page (a dev server
   // compiling its first request) may not reach for a long time. The overlay is shown again
   // when the page finishes loading, so give up quickly here.
@@ -149,12 +152,36 @@ async function overlayNow(tabId: number, fn: string, args: unknown[]): Promise<v
       target: { tabId },
       func: (f: string, a: unknown[]) => {
         const o = (window as any).__t3BrowserOverlay;
-        if (o && typeof o[f] === "function") o[f](...a);
+        // moveTo returns a promise; executeScript waits for it, so the glide finishes first.
+        if (o && typeof o[f] === "function") return o[f](...a);
       },
       args: [fn, args],
     });
   } catch {
     // Overlays are cosmetic; restricted pages and mid-navigation documents just skip them.
+  }
+}
+
+// ---- The agent's visible cursor ------------------------------------------------------------
+// Where the cursor last was in each tab, so after a navigation it continues from there.
+const pointers = new Map<number, { x: number; y: number }>();
+
+/** Glide the agent cursor to (x, y) and wait until it arrives (instant in background tabs). */
+async function glideTo(tabId: number, x: number, y: number, activity: string | null = null): Promise<void> {
+  const from = pointers.get(tabId) ?? null;
+  pointers.set(tabId, { x, y });
+  await overlay(tabId, "moveTo", x, y, from, activity);
+}
+
+/** The element's on-screen centre, without hit-testing (for typing and selecting). */
+async function centerOf(tabId: number, backendNodeId: number): Promise<{ x: number; y: number } | undefined> {
+  try {
+    const { quads } = await send<{ quads: number[][] }>(tabId, "DOM.getContentQuads", { backendNodeId });
+    const q = quads?.[0];
+    if (!q) return undefined;
+    return { x: (q[0] + q[2] + q[4] + q[6]) / 4, y: (q[1] + q[3] + q[5] + q[7]) / 4 };
+  } catch {
+    return undefined;
   }
 }
 
@@ -265,9 +292,12 @@ async function clickablePoint(tabId: number, backendNodeId: number): Promise<{ x
   return { x, y };
 }
 
-async function mouseClick(tabId: number, x: number, y: number, button = "left", clickCount = 1): Promise<void> {
+async function mouseClick(tabId: number, x: number, y: number, button = "left", clickCount = 1, activity: string | null = null): Promise<void> {
+  // Show the move first, then the click, then send the real input: the user sees what the
+  // agent is about to do instead of a jump.
+  await glideTo(tabId, x, y, activity);
   await overlay(tabId, "agentActing", 800);
-  await overlay(tabId, "pulse", x, y);
+  await overlay(tabId, "click", x, y);
   await send(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
   for (let i = 1; i <= clickCount; i++) {
     await unlessDialog(tabId, send(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", x, y, button, clickCount: i }));
@@ -495,7 +525,7 @@ export const handlers: Record<string, (s: Session, p: Params) => Promise<unknown
     const tabId = Number(p.tabId);
     await prepare(s, tabId);
     const { x, y } = await clickablePoint(tabId, resolveRef(tabId, p.ref).backendNodeId);
-    await overlay(tabId, "pulse", x, y);
+    await glideTo(tabId, x, y);
     await send(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
     return pageState(tabId);
   },
@@ -507,12 +537,14 @@ export const handlers: Record<string, (s: Session, p: Params) => Promise<unknown
     if (p.ref) {
       const { backendNodeId } = resolveRef(tabId, p.ref);
       await send(tabId, "DOM.scrollIntoViewIfNeeded", { backendNodeId }).catch(() => {});
+      const field = await centerOf(tabId, backendNodeId);
+      if (field) await glideTo(tabId, field.x, field.y, "Typing");
       try {
         await send(tabId, "DOM.focus", { backendNodeId });
       } catch {
         // Some widgets only take focus from a click.
         const { x, y } = await clickablePoint(tabId, backendNodeId);
-        await mouseClick(tabId, x, y);
+        await mouseClick(tabId, x, y, "left", 1, "Typing");
       }
       if (p.clear !== false) {
         const objectId = await objectIdFor(tabId, backendNodeId);
@@ -531,8 +563,13 @@ export const handlers: Record<string, (s: Session, p: Params) => Promise<unknown
         if (!text) await pressKey(tabId, "Delete");
       }
     }
-    if (text) await unlessDialog(tabId, send(tabId, "Input.insertText", { text }));
-    if (p.submit && !dialogs.has(tabId)) await pressKey(tabId, "Enter");
+    if (!p.ref) await overlay(tabId, "activity", "Typing");
+    try {
+      if (text) await unlessDialog(tabId, send(tabId, "Input.insertText", { text }));
+      if (p.submit && !dialogs.has(tabId)) await pressKey(tabId, "Enter");
+    } finally {
+      await overlay(tabId, "activity", null);
+    }
     return afterAction(tabId, tab.url);
   },
 
@@ -585,7 +622,15 @@ export const handlers: Record<string, (s: Session, p: Params) => Promise<unknown
     const tabId = Number(p.tabId);
     await prepare(s, tabId);
     const values: string[] = Array.isArray(p.values) ? p.values.map(String) : [String(p.values ?? p.value)];
-    const objectId = await objectIdFor(tabId, resolveRef(tabId, p.ref).backendNodeId);
+    const { backendNodeId } = resolveRef(tabId, p.ref);
+    await send(tabId, "DOM.scrollIntoViewIfNeeded", { backendNodeId }).catch(() => {});
+    const box = await centerOf(tabId, backendNodeId);
+    if (box) {
+      await glideTo(tabId, box.x, box.y, "Selecting");
+      await overlay(tabId, "click", box.x, box.y);
+      await overlay(tabId, "activity", null);
+    }
+    const objectId = await objectIdFor(tabId, backendNodeId);
     const selected = await callOn<string[] | string>(
       tabId,
       objectId,
