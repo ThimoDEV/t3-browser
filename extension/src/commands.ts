@@ -323,6 +323,34 @@ async function pressKey(tabId: number, chord: string): Promise<void> {
   await unlessDialog(tabId, send(tabId, "Input.dispatchKeyEvent", { ...base, type: "keyUp" }));
 }
 
+/** Longest the visible typing animation may take, however long the text. */
+const TYPING_MAX_MS = 1_500;
+
+/**
+ * Type `text` into the focused element. When the user can see the tab, it appears a few
+ * characters at a time (like a person typing, quickly); in a background tab nobody is watching,
+ * so it goes in at once. Very long text always goes in at once.
+ */
+async function typeText(tabId: number, s: Session, text: string): Promise<void> {
+  const chars = Array.from(text); // code points, so emoji are never split in half
+  const visible = await send<{ result: { value?: boolean } }>(tabId, "Runtime.evaluate", { expression: "document.visibilityState === 'visible'", returnByValue: true })
+    .then((r) => r.result.value === true)
+    .catch(() => false);
+  if (!visible || chars.length > 2_000) {
+    await unlessDialog(tabId, send(tabId, "Input.insertText", { text }));
+    return;
+  }
+  const steps = Math.min(chars.length, 60);
+  const size = Math.ceil(chars.length / steps);
+  const pause = Math.min(28, Math.floor(TYPING_MAX_MS / steps));
+  for (let i = 0; i < chars.length; i += size) {
+    if (s.interrupted) return;
+    await unlessDialog(tabId, send(tabId, "Input.insertText", { text: chars.slice(i, i + size).join("") }));
+    if (dialogs.has(tabId)) return;
+    if (i + size < chars.length) await sleep(pause);
+  }
+}
+
 async function pageState(tabId: number) {
   const tab = await chrome.tabs.get(tabId);
   const dialog = dialogs.get(tabId);
@@ -570,7 +598,9 @@ export const handlers: Record<string, (s: Session, p: Params) => Promise<unknown
     }
     if (!p.ref) await overlay(tabId, "activity", "Typing");
     try {
-      if (text) await unlessDialog(tabId, send(tabId, "Input.insertText", { text }));
+      if (text) await typeText(tabId, s, text);
+      // Esc while typing: stop here, and certainly do not press Enter.
+      await takeInterrupt(s);
       if (p.submit && !dialogs.has(tabId)) await pressKey(tabId, "Enter");
     } finally {
       await overlay(tabId, "activity", null);

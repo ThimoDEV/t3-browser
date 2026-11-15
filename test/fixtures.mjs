@@ -30,6 +30,14 @@ const pages = {
      <div class="modal"><div>Cookie banner <button onclick="this.closest('.modal').remove()">Accept cookies</button></div></div>`,
   ),
   "/page2.html": page("Page two", `<h1>Second page</h1><p>You made it.</p>`),
+  "/typing.html": page(
+    "Typing",
+    `<label>Message <input id="m"></label><p id="count">0</p>
+     <script>
+       let n = 0;
+       document.getElementById("m").addEventListener("input", () => (document.getElementById("count").textContent = String(++n)));
+     </script>`,
+  ),
   "/upload.html": page(
     "Upload",
     `<label>Attachment <input type="file" id="file"></label><p id="out"></p>

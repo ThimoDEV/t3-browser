@@ -218,11 +218,14 @@ async function call(name, args = {}) {
 /** Ask the extension's service worker, e.g. for a tab's group. */
 async function inExtension(expression) {
   const { targetInfos } = await user.send("Target.getTargets");
-  const sw = targetInfos.find((t) => t.type === "service_worker" && t.url.endsWith("/background.js"));
+  // By ID: Chrome ships built-in extensions with a background.js worker too.
+  const sw = targetInfos.find((t) => t.type === "service_worker" && t.url.startsWith(`chrome-extension://${EXTENSION_ID}/`));
   assert.ok(sw, "extension service worker not found");
   return user.evalIn(sw.targetId, expression);
 }
 const groupOf = (tabId) => inExtension(`chrome.tabs.get(${tabId}).then(t => t.groupId)`);
+
+const EXTENSION_ID = "doaacelnfjdbbfhhkglnkdgboeajnlhk";
 
 const refOf = (snapshot, pattern) => {
   const line = snapshot.split("\n").find((l) => pattern.test(l));
@@ -244,7 +247,9 @@ await step("lists 22 tools with instructions", async () => {
 await step("extension connects to the daemon", async () => {
   for (let i = 0; i < 60; i++) {
     const s = await call("browser_status");
-    if (s.json.bridge.extensionConnected) return;
+    // Its hello (with the version) must arrive too: it is sent from the same handler that
+    // reports "connected" to the toolbar icon.
+    if (s.json.bridge.extensionConnected && s.json.bridge.extension.version) return;
     await sleep(500);
   }
   throw new Error("extension never connected");
@@ -282,7 +287,7 @@ await step("bare localhost addresses open over http", async () => {
 });
 
 await step("non-web pages are refused with a clear error", async () => {
-  for (const url of ["chrome://settings", "chrome-extension://doaacelnfjdbbfhhkglnkdgboeajnlhk/popup.html", "file:///etc/hosts", "https://chromewebstore.google.com/"]) {
+  for (const url of ["chrome://settings", `chrome-extension://${EXTENSION_ID}/popup.html`, "file:///etc/hosts", "https://chromewebstore.google.com/"]) {
     await assert.rejects(call("browser_open", { url }), /\[restricted\].*only works with web pages/, url);
   }
   await assert.rejects(call("browser_navigate", { tab, url: "chrome://version" }), /\[restricted\]/);
@@ -566,7 +571,7 @@ await step("while idle, the popup can still stop the thread, and a page that mov
     assert.equal(await attachedTo(t), false, "detached after the idle time");
 
     // The popup: the thread is idle, not finished, so Stop must stay usable.
-    const { targetId } = await user.send("Target.createTarget", { url: "chrome-extension://doaacelnfjdbbfhhkglnkdgboeajnlhk/popup.html" });
+    const { targetId } = await user.send("Target.createTarget", { url: `chrome-extension://${EXTENSION_ID}/popup.html` });
     // The page is still loading right after createTarget; evaluate once it has settled.
     const evalWhenLoaded = async (id, expr) => {
       for (let i = 0; ; i++) {
@@ -655,6 +660,56 @@ await step("an agent on another machine uploads a file from its own disk", async
   } finally {
     await agent.close().catch(() => {});
   }
+});
+
+const SENTENCE = "The quick brown fox jumps over the lazy dog 🦊";
+
+await step("in a tab the user is watching, text is typed out rather than appearing at once", async () => {
+  const r = await call("browser_open", { url: `${site}/typing.html`, focus: true });
+  const t = r.json.tab;
+  const s = (await call("browser_snapshot", { tab: t })).text;
+  const started = Date.now();
+  await call("browser_type", { tab: t, ref: refOf(s, /textbox "Message"/), text: SENTENCE });
+  const took = Date.now() - started;
+  const state = (await call("browser_eval", { tab: t, expression: "({ value: document.getElementById('m').value, inputs: Number(document.getElementById('count').textContent) })" })).json.value;
+  assert.equal(state.value, SENTENCE, "the exact text, emoji included");
+  assert.ok(state.inputs >= 10, `typed in steps, not at once (${state.inputs} input events)`);
+  assert.ok(took < 6_000, `typing a sentence stays quick (${took}ms)`);
+  await call("browser_close_tab", { tab: t });
+});
+
+await step("in a background tab, text goes in at once", async () => {
+  const r = await call("browser_open", { url: `${site}/typing.html` });
+  const t = r.json.tab;
+  const s = (await call("browser_snapshot", { tab: t })).text;
+  await call("browser_type", { tab: t, ref: refOf(s, /textbox "Message"/), text: SENTENCE });
+  const state = (await call("browser_eval", { tab: t, expression: "({ value: document.getElementById('m').value, inputs: Number(document.getElementById('count').textContent) })" })).json.value;
+  assert.deepEqual(state, { value: SENTENCE, inputs: 1 });
+  await call("browser_close_tab", { tab: t });
+});
+
+await step("the toolbar icon shows the real connection after Chrome restarts the extension's worker", async () => {
+  const badge = () => inExtension("chrome.action.getBadgeText({})");
+  assert.equal(await badge(), "", "connected: no badge");
+  await inExtension("self.__beforeRestart = true");
+  // Chrome stops an idle service worker and starts it again on the next event, while the
+  // offscreen document stays connected.
+  const { targetInfos } = await user.send("Target.getTargets");
+  const sw = targetInfos.find((x) => x.type === "service_worker" && x.url.startsWith(`chrome-extension://${EXTENSION_ID}/`));
+  await user.send("Target.closeTarget", { targetId: sw.targetId });
+  for (let i = 0; i < 50; i++) {
+    const { targetInfos: now } = await user.send("Target.getTargets");
+    if (!now.some((x) => x.targetId === sw.targetId)) break;
+    await sleep(100);
+  }
+  await call("browser_status"); // any event wakes the worker
+  assert.equal(await inExtension("typeof self.__beforeRestart"), "undefined", "the worker really restarted");
+  let shown = "off";
+  for (let i = 0; i < 30 && shown !== ""; i++) {
+    await sleep(100);
+    shown = await badge().catch(() => "off");
+  }
+  assert.equal(shown, "", "still shows as connected after the restart");
 });
 
 await step("browser_done keeps chosen tabs and closes the rest", async () => {

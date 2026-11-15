@@ -19,11 +19,13 @@ import {
 import { isUsableTabUrl } from "./urls";
 
 const OFFSCREEN_URL = "offscreen.html";
+// Chrome stops this service worker whenever it is idle and starts it again on the next event,
+// while the offscreen document keeps the connection. So never assume: ask it (refreshTransport).
 let transportConnected = false;
 
 async function ensureOffscreen(recreate = false): Promise<void> {
   const { port } = await getSettings();
-  const url = chrome.runtime.getURL(`${OFFSCREEN_URL}?port=${port}`);
+  const url = chrome.runtime.getURL(`${OFFSCREEN_URL}?port=${port}&version=${encodeURIComponent(chrome.runtime.getManifest().version)}`);
   const contexts = await chrome.runtime.getContexts({ contextTypes: ["OFFSCREEN_DOCUMENT" as chrome.runtime.ContextType] });
   if (contexts.length && !recreate) return;
   if (contexts.length) await chrome.offscreen.closeDocument().catch(() => {});
@@ -44,6 +46,13 @@ function setBadge(): void {
   chrome.action
     .setTitle({ title: transportConnected ? "T3 Browser: connected to T3 Code" : "T3 Browser: waiting for T3 Code" })
     .catch(() => {});
+}
+
+/** Ask the offscreen document whether it is connected, and show that on the toolbar icon. */
+async function refreshTransport(): Promise<void> {
+  const connected = await chrome.runtime.sendMessage({ kind: "transport-query" }).catch(() => undefined);
+  if (typeof connected === "boolean") transportConnected = connected;
+  setBadge();
 }
 
 function postEvent(msg: EventMessage): void {
@@ -87,6 +96,11 @@ async function scheduleIdleDetach(): Promise<void> {
 }
 
 async function handleRpc(req: RequestMessage): Promise<ResponseMessage> {
+  // A request from the daemon proves the connection is up.
+  if (!transportConnected) {
+    transportConnected = true;
+    setBadge();
+  }
   // The control page polls status; that is not the agent being busy.
   if (req.method !== "status") void scheduleIdleDetach();
   try {
@@ -230,9 +244,8 @@ chrome.runtime.onStartup.addListener(() => void ensureOffscreen());
 chrome.alarms.create("keepalive", { periodInMinutes: 0.5 });
 chrome.alarms.onAlarm.addListener((a) => {
   if (a.name !== "keepalive") return;
-  void ensureOffscreen();
+  void ensureOffscreen().then(refreshTransport);
   // Backstop for the timer above, in case the service worker slept in between.
   void detachIdleTabs();
 });
-void ensureOffscreen();
-setBadge();
+void ensureOffscreen().then(refreshTransport);

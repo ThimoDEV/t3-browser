@@ -4,7 +4,12 @@
 
 import { PROTOCOL_VERSION, type RequestMessage, type WireMessage } from "../../src/protocol";
 
-const port = Number(new URLSearchParams(location.search).get("port") ?? 47823);
+const params = new URLSearchParams(location.search);
+const port = Number(params.get("port") ?? 47823);
+// Offscreen documents only get chrome.runtime messaging: no getManifest(). The service worker
+// passes the version in the URL. (Calling getManifest() here threw inside onopen, so the hello,
+// the "connected" badge report and the keep-alive pings never happened.)
+const version = params.get("version") ?? "";
 let ws: WebSocket | null = null;
 let retryMs = 1000;
 let pingTimer: number | undefined;
@@ -24,7 +29,7 @@ function connect(): void {
         type: "hello",
         role: "extension",
         protocol: PROTOCOL_VERSION,
-        version: chrome.runtime.getManifest().version,
+        version,
         userAgent: navigator.userAgent,
       } satisfies WireMessage),
     );
