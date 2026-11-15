@@ -62,6 +62,18 @@ Start a **new** thread in T3 Code (MCP servers load when a session starts) and a
 
 `node dist/cli.js doctor` checks that the daemon is running and the extension is connected, and shows how long each kind of call into Chrome has taken (count, p50, p95, max). Slow (over 5s) and failed calls are also written to `~/.t3-browser/daemon.log`. `node dist/cli.js uninstall` removes the registrations.
 
+## Commands
+
+| Command | What it does |
+| --- | --- |
+| `node dist/cli.js install` | Register the MCP server and skill with Claude Code, Codex and Cursor |
+| `node dist/cli.js doctor` | Check the daemon and the extension, and show how long calls into Chrome take |
+| `npm run reload` | Build, then make the connected Chrome load the new extension |
+| `node dist/cli.js control` | Print the link to the control page (open it on your phone over Tailscale) |
+| `node dist/cli.js remote --listen <ip>` | Let agents on other machines use the Chrome on this machine |
+| `node dist/cli.js remote-link <url>` | On an agent machine: use the Chrome on another machine (asks for the token) |
+| `node dist/cli.js stop` | Stop the daemon; the next browser call starts it again |
+
 ## Control page
 
 `node dist/cli.js control` prints a link (it carries the daemon's token once, then a cookie takes over). The page lists every thread that used Chrome since the daemon started: its tabs, its recent actions ("opened https://…", "typed 12 characters", never the text itself or URL query strings), a **Peek** button that screenshots a tab, and **Stop** (per thread, or all). Stop works like pressing Esc: the agent is told to stop and ask you.
