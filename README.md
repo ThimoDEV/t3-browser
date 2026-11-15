@@ -1,0 +1,102 @@
+# T3 Browser
+
+Let [T3 Code](https://github.com/pingdotgg/t3code) agents use your browser.
+
+It works like the Codex Chrome extension, for every agent T3 Code runs (Claude Code, Codex, Cursor):
+
+- **Your real Chrome, your sign-ins.** An agent works in its own tab group named after the thread, in the background, next to your own tabs.
+- **You stay in charge.** You approve each new site once ("for this thread" or "always"). Pressing **Esc** on a controlled tab, or clicking **Stop**, hands control straight back, and the agent is told to stop and ask you.
+- **Plus a clean browser.** For public pages and local dev servers, agents can use an isolated Chrome driven by Vercel's [agent-browser](https://github.com/vercel-labs/agent-browser). It has no cookies and needs no approvals.
+- **agent-browser on your real tabs.** The bridge exposes a CDP endpoint scoped to the thread's tab group, so `agent-browser connect` (or Playwright) can drive your signed-in tabs, with the same approvals.
+
+```
+T3 Code thread ─▶ Claude Code / Codex / Cursor
+                     │ MCP (stdio): browser_open, browser_snapshot, browser_click, …
+                     ▼
+               t3-browser mcp ──────────────▶ agent-browser ──▶ isolated Chrome
+                     │ ws /client (token)
+                     ▼
+               t3-browser daemon  ◀── ws /cdp/<thread> ── agent-browser connect (power mode)
+               127.0.0.1:47823
+                     │ ws /extension (Origin = pinned extension ID)
+                     ▼
+               T3 Browser extension ──chrome.debugger (CDP)──▶ your tabs
+```
+
+## Install
+
+Requires Node 20+ and Chrome (or Edge, Brave and other Chromium browsers).
+
+```sh
+git clone https://github.com/ThimoDEV/t3-browser
+cd t3-browser
+npm install
+npm run build
+node dist/cli.js install        # registers the MCP server + skill with claude, codex and cursor
+```
+
+Then load the extension once:
+
+1. Open `chrome://extensions` and turn on **Developer mode**.
+2. Click **Load unpacked** and pick the `extension/dist` folder (`node dist/cli.js extension-path` prints it).
+3. Pin **T3 Browser** to the toolbar. Its popup shows connection status, which threads are active, a **Stop** button, and the sites you've allowed.
+
+Start a **new** thread in T3 Code (MCP servers load when a session starts) and ask something like *"check my GitHub notifications and summarise the ones about t3code"*.
+
+`node dist/cli.js doctor` checks that the daemon is running and the extension is connected. `node dist/cli.js uninstall` removes the registrations.
+
+## What agents get
+
+| Tool | Does |
+| --- | --- |
+| `browser_open` | New tab in the user's Chrome (default) or `browser: "isolated"` |
+| `browser_tabs` / `browser_claim_tab` | List this thread's tabs, or all of the user's (asks first) and take one over (asks first) |
+| `browser_snapshot` | Accessibility tree with refs: `- button "Send" [ref=e6]`; `interactive: true` for a flat short list; includes same-process iframes |
+| `browser_click` / `browser_type` / `browser_press` / `browser_select` / `browser_hover` / `browser_scroll` | Real input events through CDP. Clicks fail with `[covered]` instead of mis-clicking under a modal |
+| `browser_read` / `browser_screenshot` / `browser_eval` / `browser_wait` | Read text (paged), capture (works for background tabs too), evaluate JS, wait for text/selector/URL/load |
+| `browser_upload` / `browser_dialog` | File inputs (the user confirms the file list), `alert`/`confirm`/`prompt` |
+| `browser_navigate` / `browser_close_tab` / `browser_name_session` / `browser_done` | Navigation, cleanup, naming the tab group, handing back control |
+| `browser_cdp_url` | CDP endpoint for `agent-browser connect` on the user's tabs |
+| `browser_status` | Is the extension connected, which tabs are mine |
+
+The server also sends usage and safety instructions in its MCP `initialize` response, and installs a `t3-browser` skill for Claude Code and Codex.
+
+## Security model
+
+- The daemon binds `127.0.0.1` only.
+- The browser side accepts exactly one Origin: `chrome-extension://doaacelnfjdbbfhhkglnkdgboeajnlhk`. The ID is pinned by the public key in the manifest, and web pages cannot forge that Origin.
+- Local clients (the MCP server, CDP clients) need the random token in `~/.t3-browser/token`, and any connection that carries a web Origin is refused even if it has the token. A page that finds the port still can't drive the browser.
+- The extension refuses browser-internal pages and the Web Store. It asks before each new origin, before listing your tabs, before taking over a tab, and before uploading files. "Always allow" lives in the popup, where you can revoke it.
+- Agents only touch tabs in their own group. Another thread's tab is off limits (`[ownership_conflict]`).
+- The agent instructions treat page content as untrusted, and agents must confirm in chat before sending, buying, deleting or changing account settings.
+- Turning on "Let agents use any site without asking" in the popup skips the site prompts. Esc and Stop still work.
+
+## How it compares
+
+| | Codex Chrome extension | T3 Browser |
+| --- | --- | --- |
+| Agents | Codex | Whatever T3 Code runs: Claude Code, Codex, Cursor (anything that speaks MCP) |
+| Transport | Native messaging host + named pipe | Localhost WebSocket with Origin + token auth (no installer or registry keys) |
+| Page model | AX tree / DOM / Playwright-style locators in a JS REPL | MCP tools over an agent-browser-compatible AX snapshot with `@eN` refs |
+| Isolated browser | In-app browser | agent-browser (headless or headed Chrome) |
+| Raw CDP | Per-tab `cdp.send` | Full browser-level CDP endpoint per thread (agent-browser, Playwright) |
+
+## Development
+
+```sh
+npm run dev          # rebuild CLI + extension on change (reload the extension in chrome://extensions)
+npm run typecheck
+npm test             # unit tests: snapshot formatter, keys, daemon auth + routing
+npx @puppeteer/browsers install chrome@stable --path .cache/browsers
+npm run test:e2e     # real Chrome for Testing + extension + daemon + MCP, end to end (HEADED=1 to watch)
+```
+
+The e2e suite runs the whole chain through an MCP client and plays the user by answering the approval windows. It covers approvals and denials, Esc takeover, dialogs, iframes, covered elements, background-tab screenshots, new-tab adoption, the agent-browser CDP relay and the isolated browser.
+
+Environment: `T3_BROWSER_PORT` (default 47823, change the extension's port in its storage too), `T3_BROWSER_HOME` (default `~/.t3-browser`), `T3_BROWSER_SESSION_ID` / `T3_BROWSER_SESSION_TITLE` (default: `T3CODE_THREAD_ID` and the project folder name), `T3_BROWSER_DEBUG=1`.
+
+## Limits
+
+- Cross-process (out-of-process) iframes don't show up in `browser_snapshot` yet. Use `browser_cdp_url` with agent-browser for those pages.
+- Chrome shows its own "T3 Browser started debugging this browser" bar while an agent is attached. Clicking **Cancel** on it also stops the agent.
+- The extension isn't on the Web Store yet, so it is loaded unpacked.

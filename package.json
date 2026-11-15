@@ -1,0 +1,40 @@
+{
+  "name": "t3-browser",
+  "version": "0.1.0",
+  "description": "Let T3 Code agents drive your real, signed-in Chrome (via an extension) or an isolated agent-browser session.",
+  "license": "MIT",
+  "repository": "github:ThimoDEV/t3-browser",
+  "type": "module",
+  "bin": {
+    "t3-browser": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "extension/dist",
+    "skills"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "dev": "node scripts/build.mjs --watch",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p extension/tsconfig.json",
+    "test": "vitest run",
+    "test:e2e": "node scripts/build.mjs && node test/e2e.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "agent-browser": "^0.43.0",
+    "ws": "^8.23.0",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.3.7",
+    "@types/node": "^24.0.0",
+    "@types/ws": "^8.18.2",
+    "esbuild": "^0.28.2",
+    "typescript": "^5.9.0",
+    "vitest": "^5.1.0"
+  }
+}
