@@ -9,7 +9,11 @@ import WebSocket from "ws";
 const PORT = 48100 + Math.floor(Math.random() * 500);
 process.env.T3_BROWSER_HOME = mkdtempSync(join(tmpdir(), "t3b-unit-"));
 process.env.T3_BROWSER_PORT = String(PORT);
-process.env.T3_BROWSER_RELEASE_AFTER_MS = "300";
+/** How long a thread may be gone before the daemon releases its tabs (shortened for tests). */
+const GRACE_MS = 300;
+/** Long enough that a release would have happened by now if one were coming. */
+const PAST_GRACE_MS = GRACE_MS * 2 + 100;
+process.env.T3_BROWSER_RELEASE_AFTER_MS = String(GRACE_MS);
 
 const { Daemon } = await import("../../src/daemon");
 const { EXTENSION_ID } = await import("../../src/protocol");
@@ -44,6 +48,24 @@ function waitFor(ws: WebSocket, match: (m: any) => boolean, ms = 2_000): Promise
     };
     ws.on("message", onMessage);
   });
+}
+
+/** Close ws and resolve once the closing handshake is done (the daemon has seen it). */
+function closeAndWait(ws: WebSocket): Promise<void> {
+  return new Promise((resolve) => {
+    ws.once("close", () => resolve());
+    ws.close();
+  });
+}
+
+/** Resolve once the daemon's public health check reports no Chrome extension. */
+async function extensionGone(): Promise<void> {
+  for (let i = 0; i < 50; i++) {
+    const health = await (await fetch(`http://127.0.0.1:${PORT}/health`)).json();
+    if (!health.extensionConnected) return;
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  throw new Error("the daemon never noticed the extension disconnect");
 }
 
 function next(ws: WebSocket): Promise<any> {
@@ -154,7 +176,7 @@ describe("threads that go away", () => {
     const a = await client("gone-2");
     const b = await client("gone-2", "daemon.status");
     a.close();
-    expect(await waitFor(ext, releaseFor("gone-2"), 700)).toBeUndefined();
+    expect(await waitFor(ext, releaseFor("gone-2"), PAST_GRACE_MS)).toBeUndefined();
     const release = waitFor(ext, releaseFor("gone-2"));
     b.close();
     expect(await release).toBeDefined();
@@ -165,7 +187,7 @@ describe("threads that go away", () => {
     const ext = await fakeExtension();
     (await client("gone-3")).close();
     const back = await client("gone-3", "status");
-    expect(await waitFor(ext, releaseFor("gone-3"), 700)).toBeUndefined();
+    expect(await waitFor(ext, releaseFor("gone-3"), PAST_GRACE_MS)).toBeUndefined();
     back.close();
     expect(await waitFor(ext, releaseFor("gone-3"))).toBeDefined();
     ext.close();
@@ -176,7 +198,7 @@ describe("threads that go away", () => {
     const c = await client("gone-4");
     await request(c, "gone-4", "session.release", { keepTabIds: [] });
     c.close();
-    expect(await waitFor(ext, (m) => releaseFor("gone-4")(m) && m.params?.keepGroup, 700)).toBeUndefined();
+    expect(await waitFor(ext, (m) => releaseFor("gone-4")(m) && m.params?.keepGroup, PAST_GRACE_MS)).toBeUndefined();
     ext.close();
   });
 
@@ -184,10 +206,11 @@ describe("threads that go away", () => {
     const ext = await fakeExtension();
     const c = await client("gone-5");
     ext.close();
-    await new Promise((r) => setTimeout(r, 100));
-    c.close();
-    // The release timer fires while Chrome is away, so nothing can be released yet.
-    await new Promise((r) => setTimeout(r, 600));
+    await extensionGone();
+    await closeAndWait(c);
+    // Deliberately outwait the grace period: the release must come due while Chrome is away,
+    // or this would pass without any retry logic.
+    await new Promise((r) => setTimeout(r, PAST_GRACE_MS));
     const back = await fakeExtension();
     expect(await waitFor(back, releaseFor("gone-5"))).toBeDefined();
     back.close();
@@ -208,8 +231,7 @@ describe("threads that go away", () => {
     const ext = await fakeExtension();
     const c = await client("gone-7");
     const relay = await connect(`/cdp/gone-7?token=${daemon.token}`);
-    c.close();
-    await new Promise((r) => setTimeout(r, 100));
+    await closeAndWait(c);
     // The relay keeps talking to Chrome after the agent is gone (Target.getTargets makes the
     // daemon call tabs.list for the thread). That must not cancel the pending release.
     const answered = next(relay);

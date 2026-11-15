@@ -1,6 +1,6 @@
 // Tab groups are named after the real T3 Code thread, and a settled or archived thread
 // releases its tabs. Both come from `t3 thread show <id> --json`.
-import { chmodSync, mkdtempSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -68,11 +68,31 @@ describe("readThread", () => {
     expect(await readThread(cli, "")).toBeUndefined();
   });
 
-  it("gives up quietly when the CLI is missing or hangs", async () => {
+  it("reports nothing when the CLI is missing", async () => {
     expect(await readThread(join(tmpdir(), "does-not-exist", "t3"), "abc")).toBeUndefined();
-    const slow = fakeCli(`setTimeout(() => process.stdout.write("{}"), 10_000);`);
+  });
+
+  it("stops a CLI that hangs, including the process behind the Windows .cmd launcher", async () => {
+    const pidFile = join(mkdtempSync(join(tmpdir(), "t3b-pid-")), "pid");
+    const hanging = fakeCli(
+      `import { writeFileSync } from "node:fs";
+       writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));
+       setTimeout(() => process.stdout.write("{}"), 30_000);`,
+    );
     const started = Date.now();
-    expect(await readThread(slow, "abc", 500)).toBeUndefined();
-    expect(Date.now() - started).toBeLessThan(3_000);
+    expect(await readThread(hanging, "abc", 1_000)).toBeUndefined();
+    expect(Date.now() - started).toBeLessThan(5_000);
+    // The CLI itself (not just a cmd.exe in front of it) must be gone shortly after.
+    const pid = Number(readFileSync(pidFile, "utf8"));
+    const alive = () => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    for (let i = 0; i < 40 && alive(); i++) await new Promise((r) => setTimeout(r, 50));
+    expect(alive(), `CLI process ${pid} is still running`).toBe(false);
   });
 });
