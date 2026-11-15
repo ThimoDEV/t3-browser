@@ -113,19 +113,23 @@ chrome = spawn(
     "--no-default-browser-check",
     "--window-size=1280,900",
     ...(process.env.HEADED ? [] : ["--headless=new"]),
+    // CI runners (Ubuntu) block the user-namespace sandbox.
+    ...(process.env.CI ? ["--no-sandbox"] : []),
     "about:blank",
   ],
-  { stdio: "ignore" },
+  { stdio: ["ignore", "ignore", "pipe"] },
 );
+let chromeStderr = "";
+chrome.stderr.on("data", (d) => (chromeStderr = (chromeStderr + d).slice(-4000)));
 
 let devtoolsPort;
-for (let i = 0; i < 100 && !devtoolsPort; i++) {
+for (let i = 0; i < 300 && !devtoolsPort; i++) {
   await sleep(100);
   try {
     devtoolsPort = Number(readFileSync(join(profile, "DevToolsActivePort"), "utf8").split("\n")[0]);
   } catch {}
 }
-assert.ok(devtoolsPort, "Chrome did not start");
+assert.ok(devtoolsPort, `Chrome did not start:\n${chromeStderr}`);
 const version = await (await fetch(`http://127.0.0.1:${devtoolsPort}/json/version`)).json();
 const user = new Cdp(version.webSocketDebuggerUrl);
 await user.ready;

@@ -31,3 +31,5 @@ jobs:
       - run: npm ci
       - run: npx -y @puppeteer/browsers install chrome@stable --path .cache/browsers
       - run: npm run test:e2e
+        env:
+          AGENT_BROWSER_ARGS: --no-sandbox
