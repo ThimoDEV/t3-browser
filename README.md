@@ -4,7 +4,7 @@ Let [T3 Code](https://github.com/pingdotgg/t3code) agents use your browser.
 
 It works like the Codex Chrome extension, for every agent T3 Code runs (Claude Code, Codex, Cursor):
 
-- **Your real Chrome, your sign-ins.** An agent works in its own tab group named after the thread, in the background, next to your own tabs. With the extension installed and connected, `browser_open` just opens the page in that group: no per-site prompt.
+- **Your real Chrome, your sign-ins.** An agent works in its own tab group named after the thread, in the background, next to your own tabs. With the extension installed and connected, `browser_open` just opens the page in that group. There are no permission prompts at all.
 - **Web pages only.** Agents get http and https pages (localhost included). Browser pages (`chrome://`, `chrome-extension://`, `devtools://`), local files and the Chrome Web Store are refused.
 - **You see what it does.** When you watch a controlled tab, the agent's own cursor (a purple arrow tagged "T3 Code") glides to each element and shows the click or "Typing…" before the real input is sent. In background tabs it skips the animation, so nothing slows down.
 - **You stay in charge.** Pressing **Esc** on a controlled tab, or clicking **Stop**, hands control straight back, and the agent is told to stop and ask you.
@@ -43,7 +43,7 @@ Then load the extension once:
 2. Click **Load unpacked** and pick the `extension/dist` folder (`node dist/cli.js extension-path` prints it).
 3. Pin **T3 Browser** to the toolbar. Its popup shows connection status, which threads are active, and a **Stop** button.
 
-After pulling a new version, run `npm run build` and click the reload icon on the T3 Browser card in `chrome://extensions`.
+After pulling a new version, run `npm run reload`: it builds and tells the connected Chrome to load the new extension. (Builds from before this command need one manual click on the reload icon in `chrome://extensions`.)
 
 Start a **new** thread in T3 Code (MCP servers load when a session starts) and ask something like *"check my GitHub notifications and summarise the ones about t3code"*.
 
@@ -54,11 +54,11 @@ Start a **new** thread in T3 Code (MCP servers load when a session starts) and a
 | Tool | Does |
 | --- | --- |
 | `browser_open` | New tab in the thread's tab group in the user's Chrome (default), or `browser: "isolated"` |
-| `browser_tabs` / `browser_claim_tab` | List this thread's tabs, or all of the user's (asks first) and take one over (asks first) |
+| `browser_tabs` / `browser_claim_tab` | List this thread's tabs, or all of the user's web tabs, and take one over into the thread's group |
 | `browser_snapshot` | Accessibility tree with refs: `- button "Send" [ref=e6]`; `interactive: true` for a flat short list; includes same-process iframes |
 | `browser_click` / `browser_type` / `browser_press` / `browser_select` / `browser_hover` / `browser_scroll` | Real input events through CDP. Clicks fail with `[covered]` instead of mis-clicking under a modal |
 | `browser_read` / `browser_screenshot` / `browser_eval` / `browser_wait` | Read text (paged), capture (works for background tabs too), evaluate JS, wait for text/selector/URL/load |
-| `browser_upload` / `browser_dialog` | File inputs (the user confirms the file list), `alert`/`confirm`/`prompt` |
+| `browser_upload` / `browser_dialog` | File inputs, `alert`/`confirm`/`prompt` |
 | `browser_navigate` / `browser_close_tab` / `browser_name_session` / `browser_done` | Navigation, cleanup, naming the tab group, handing back control |
 | `browser_cdp_url` | CDP endpoint for `agent-browser connect` on the user's tabs |
 | `browser_status` | Is the extension connected, which tabs are mine |
@@ -70,7 +70,7 @@ The server also sends usage and safety instructions in its MCP `initialize` resp
 - The daemon binds `127.0.0.1` only.
 - The browser side accepts exactly one Origin: `chrome-extension://doaacelnfjdbbfhhkglnkdgboeajnlhk`. The ID is pinned by the public key in the manifest, and web pages cannot forge that Origin.
 - Local clients (the MCP server, CDP clients) need the random token in `~/.t3-browser/token`, and any connection that carries a web Origin is refused even if it has the token. A page that finds the port still can't drive the browser.
-- The extension only works on web pages (http/https). It refuses browser-internal pages, extension pages, local files and the Web Store, for opening, navigating, acting and claiming alike. Sites need no approval; it still asks before listing your tabs, before taking over a tab you opened, and before uploading files. Those prompts give up after 90 seconds with a clear `[no_answer]`, so an unseen prompt never hangs the agent.
+- The extension only works on web pages (http/https). It refuses browser-internal pages, extension pages, local files and the Web Store, for opening, navigating, acting and claiming alike. It never asks for permission: opening sites, listing your web tabs, taking one over and uploads just happen, and you watch (and stop) it in the tab itself. The agent instructions say to upload only files you asked for.
 - Agents only touch tabs in their own group. Another thread's tab is off limits (`[ownership_conflict]`).
 - The agent instructions treat page content as untrusted, and agents must confirm in chat before sending, buying, deleting or changing account settings.
 
@@ -88,13 +88,14 @@ The server also sends usage and safety instructions in its MCP `initialize` resp
 
 ```sh
 npm run dev          # rebuild CLI + extension on change (reload the extension in chrome://extensions)
+npm run reload       # build, then make the connected Chrome load the new extension build
 npm run typecheck
 npm test             # unit tests: snapshot formatter, keys, daemon auth + routing
 npx @puppeteer/browsers install chrome@stable --path .cache/browsers
 npm run test:e2e     # real Chrome for Testing + extension + daemon + MCP, end to end (HEADED=1 to watch)
 ```
 
-The e2e suite runs the whole chain through an MCP client and plays the user by answering the remaining prompts. It covers opening without a site prompt into the thread's tab group, refusing non-web pages, Esc takeover, dialogs, iframes, covered elements, background-tab screenshots, new-tab adoption, the agent-browser CDP relay and the isolated browser.
+The e2e suite runs the whole chain through an MCP client and fails if the extension ever opens a prompt window. It covers opening into the thread's tab group, claiming the user's tab, refusing non-web pages, Esc takeover, dialogs, iframes, covered elements, background-tab screenshots, new-tab adoption, the agent-browser CDP relay and the isolated browser.
 
 Environment: `T3_BROWSER_PORT` (default 47823, change the extension's port in its storage too), `T3_BROWSER_HOME` (default `~/.t3-browser`), `T3_BROWSER_SESSION_ID` / `T3_BROWSER_SESSION_TITLE` (default: `T3CODE_THREAD_ID` and the project folder name), `T3_BROWSER_DEBUG=1`.
 

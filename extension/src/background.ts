@@ -8,11 +8,9 @@ import {
   ActionError,
   addTab,
   allSessions,
-  getApproval,
   getSettings,
   markInterrupted,
   removeTab,
-  resolveApproval,
   sessionForTab,
   takeInterrupt,
   updateSettings,
@@ -96,12 +94,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       sessionForTab(tabId).then((s) => s && interruptSession(s, message.reason === "escape" ? "pressed Esc" : "clicked Stop"));
       return false;
     }
-    case "approval-get":
-      sendResponse(getApproval(message.id) ?? null);
-      return false;
-    case "approval-decide":
-      resolveApproval(message.id, message.decision);
-      return false;
     case "popup-state":
       (async () => {
         const sessions = await allSessions();

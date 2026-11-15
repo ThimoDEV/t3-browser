@@ -1,4 +1,4 @@
-import { BridgeClient, ensureDaemon } from "./client.js";
+import { BridgeClient, ensureDaemon, isDaemonRunning } from "./client.js";
 import { runDaemon } from "./daemon.js";
 import { extensionSteps, install, openExtensionsPage, uninstall } from "./install.js";
 import { runMcp, sessionFromEnv } from "./mcp.js";
@@ -13,6 +13,7 @@ Usage:
   t3-browser doctor                                    Check the daemon, the extension and registrations
   t3-browser cdp-url [--session <id>]                  Print a CDP URL for \`agent-browser connect\`
   t3-browser extension-path                            Print the unpacked extension folder
+  t3-browser reload-extension                          Make Chrome load the freshly built extension
   t3-browser mcp                                       Run the MCP server on stdio (what agents launch)
   t3-browser daemon                                    Run the bridge daemon in the foreground
 `;
@@ -44,6 +45,29 @@ async function main(argv: string[]): Promise<void> {
       const s = await client.call<{ cdpUrl: string }>("daemon.status");
       console.log(s.cdpUrl);
       client.close();
+      return;
+    }
+    case "reload-extension": {
+      if (!(await isDaemonRunning())) {
+        console.log("The daemon is not running, so there is no connected extension to reload. Reload it in chrome://extensions.");
+        return;
+      }
+      const client = new BridgeClient({ id: "reload-extension", title: "reload-extension" });
+      try {
+        const s = await client.call<{ extensionConnected: boolean }>("daemon.status");
+        if (!s.extensionConnected) {
+          console.log("The Chrome extension is not connected. Reload it in chrome://extensions.");
+          return;
+        }
+        await client.call("extension.reload");
+        console.log("Chrome is reloading T3 Browser from " + EXTENSION_DIR);
+      } catch (e) {
+        // Builds from before this command existed do not know it.
+        console.log(`Could not reload automatically (${(e as Error).message}). Reload T3 Browser once in chrome://extensions.`);
+        process.exitCode = 1;
+      } finally {
+        client.close();
+      }
       return;
     }
     case "doctor": {

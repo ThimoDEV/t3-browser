@@ -10,6 +10,8 @@ interface Point {
 }
 
 interface OverlayApi {
+  /** Build that injected this overlay. */
+  build?: string;
   show(label: string): void;
   hide(): void;
   /** Glide the agent cursor to (x, y), starting from `from` (or the control pill). Resolves on arrival. */
@@ -30,8 +32,24 @@ declare global {
   }
 }
 
+declare const __VERSION__: string;
+// Changes with every build, so a reloaded extension replaces the overlay an older build left in
+// the page (content scripts share one world per extension across reloads).
+const BUILD = `${__VERSION__}+${__BUILD_ID__}`;
+declare const __BUILD_ID__: string;
+
 (() => {
-  if (window.top !== window || window.__t3BrowserOverlay) return;
+  if (window.top !== window) return;
+  const existing = window.__t3BrowserOverlay;
+  if (existing?.build === BUILD) return;
+  if (existing) {
+    try {
+      existing.hide();
+    } catch {
+      // an orphaned overlay from an old build may throw; its element is removed below anyway
+    }
+    document.querySelectorAll("t3-browser-overlay").forEach((el) => el.remove());
+  }
 
   const host = document.createElement("t3-browser-overlay");
   host.setAttribute("aria-hidden", "true");
@@ -164,6 +182,7 @@ declare global {
   };
 
   window.__t3BrowserOverlay = {
+    build: BUILD,
     show(text: string) {
       label.textContent = text;
       visible = true;
@@ -217,7 +236,7 @@ declare global {
   };
 
   // Single-page apps sometimes replace <html> children wholesale; keep the overlay attached.
-  new MutationObserver(() => visible && mount()).observe(document, { childList: true, subtree: false });
+  new MutationObserver(() => visible && window.__t3BrowserOverlay?.build === BUILD && mount()).observe(document, { childList: true, subtree: false });
 })();
 
 export {};

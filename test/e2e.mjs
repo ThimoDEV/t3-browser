@@ -1,7 +1,7 @@
 // End-to-end: real Chrome for Testing + the built extension + the daemon + the MCP server,
-// driven through an MCP client exactly like an agent would. The prompts that remain (listing
-// all tabs, claiming, uploads) are answered by this script over a separate DevTools
-// connection, playing the role of the user. Opening sites never prompts.
+// driven through an MCP client exactly like an agent would. A separate DevTools connection
+// plays the user (pressing Esc, opening tabs) and checks that no extension window ever pops up:
+// there are no permission prompts.
 //
 //   npx @puppeteer/browsers install chrome@stable --path .cache/browsers
 //   npm run test:e2e            (HEADED=1 to watch)
@@ -136,24 +136,21 @@ const version = await (await fetch(`http://127.0.0.1:${devtoolsPort}/json/versio
 const user = new Cdp(version.webSocketDebuggerUrl);
 await user.ready;
 
-// "The user" answers approval windows according to this policy.
-let policy = () => "once";
-const approvalsSeen = [];
-let approverOn = true;
+// Any page the extension opens itself (a prompt window) is a failure: agents never need permission.
+const extensionPagesSeen = [];
+let watcherOn = true;
 (async () => {
-  while (approverOn) {
+  while (watcherOn) {
     try {
       const { targetInfos } = await user.send("Target.getTargets");
-      for (const t of targetInfos.filter((t) => t.url.includes("/approve.html"))) {
-        const title = await user.evalIn(t.targetId, "new Promise(r => setTimeout(() => r(document.getElementById('title').textContent), 150))");
-        const decision = policy(title);
-        approvalsSeen.push({ title, decision });
-        await user.evalIn(t.targetId, `document.getElementById(${JSON.stringify(decision)}).click()`).catch(() => {});
+      for (const t of targetInfos) {
+        if (t.type === "page" && t.url.startsWith("chrome-extension://") && !extensionPagesSeen.includes(t.url)) extensionPagesSeen.push(t.url);
       }
     } catch {}
     await sleep(250);
   }
 })();
+const assertNoPrompts = () => assert.deepEqual(extensionPagesSeen, [], "the extension must not open any prompt window");
 
 const env = {
   ...process.env,
@@ -221,7 +218,7 @@ await step("open needs no approval and lands in the thread's tab group", async (
   const r = await call("browser_open", { url: `${site}/form.html` });
   tab = r.json.tab;
   assert.equal(r.json.title, "Signup form");
-  assert.deepEqual(approvalsSeen, [], "opening a site must not prompt");
+  assertNoPrompts();
   const status = (await call("browser_status")).json;
   const groupId = status.user.session.groupId;
   assert.ok(groupId >= 0, JSON.stringify(status.user.session));
@@ -231,7 +228,7 @@ await step("open needs no approval and lands in the thread's tab group", async (
 
 await step("a second tab joins the same group, right after the first", async () => {
   const r = await call("browser_open", { url: `${otherOrigin}/page2.html` });
-  assert.deepEqual(approvalsSeen, [], "a new origin must not prompt either");
+  assertNoPrompts();
   assert.equal(await groupOf(r.json.tab), await groupOf(tab));
   const [a, b] = await inExtension(`Promise.all([chrome.tabs.get(${tab}), chrome.tabs.get(${r.json.tab})]).then(ts => ts.map(t => t.index))`);
   assert.equal(b, a + 1);
@@ -336,14 +333,27 @@ await step("stale refs are rejected", async () => {
 await step("navigating to another origin just works", async () => {
   const r = await call("browser_navigate", { tab, url: `${otherOrigin}/page2.html` });
   assert.equal(r.json.url, `${otherOrigin}/page2.html`);
-  assert.deepEqual(approvalsSeen, []);
+  assertNoPrompts();
 });
 
-await step("listing all tabs shows web tabs only", async () => {
+await step("listing all tabs shows web tabs only, without asking", async () => {
   await user.send("Target.createTarget", { url: "chrome://version" });
   const all = (await call("browser_tabs", { scope: "all" })).json;
-  assert.ok(approvalsSeen.some((a) => /open tabs/.test(a.title)), JSON.stringify(approvalsSeen));
+  assertNoPrompts();
   assert.ok(all.length > 0 && all.every((t) => /^https?:/.test(t.url)), JSON.stringify(all));
+});
+
+await step("claiming one of the user's web tabs needs no confirmation", async () => {
+  await user.send("Target.createTarget", { url: `${site}/page2.html?mine=user` });
+  await sleep(500);
+  const all = (await call("browser_tabs", { scope: "all" })).json;
+  const theirs = all.find((t) => t.url.endsWith("?mine=user"));
+  assert.ok(theirs && !theirs.mine, JSON.stringify(all));
+  const claimed = (await call("browser_claim_tab", { tab: theirs.tab })).json;
+  assert.equal(claimed.mine, true);
+  assertNoPrompts();
+  assert.equal(await groupOf(theirs.tab), (await call("browser_status")).json.user.session.groupId);
+  await call("browser_close_tab", { tab: theirs.tab });
 });
 
 await step("links opening a new tab join the thread", async () => {
@@ -437,7 +447,7 @@ await step("browser_done keeps chosen tabs and closes the rest", async () => {
 });
 
 // ---- teardown --------------------------------------------------------------------------
-approverOn = false;
+watcherOn = false;
 await mcp.close().catch(() => {});
 chrome.kill();
 fixtures.close();

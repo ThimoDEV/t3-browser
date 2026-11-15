@@ -27,7 +27,7 @@ export interface TabInfo {
 
 export interface RpcError {
   message: string;
-  /** Machine-readable reason, e.g. "interrupted", "restricted", "denied", "no_answer", "no_extension". */
+  /** Machine-readable reason, e.g. "interrupted", "restricted", "not_owned", "no_extension". */
   code?: string;
 }
 
@@ -95,6 +95,7 @@ export const EXTENSION_METHODS = [
   "cdp.attach",
   "cdp.detach",
   "cdp.send",
+  "extension.reload",
 ] as const;
 
 export type ExtensionMethod = (typeof EXTENSION_METHODS)[number];

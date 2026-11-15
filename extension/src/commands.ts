@@ -11,9 +11,6 @@ import {
   assertUsableTab,
   assertWebUrl,
   dropSession,
-  ensureMayClaim,
-  ensureMayListTabs,
-  ensureMayUpload,
   getSession,
   placeForNewTab,
   renameSession,
@@ -102,13 +99,6 @@ async function withDeadline<T>(work: Promise<T>, ms: number, what: string): Prom
   }
 }
 
-function originOf(url: string): string {
-  try {
-    return new URL(url).origin;
-  } catch {
-    return url;
-  }
-}
 
 function tabInfo(tab: chrome.tabs.Tab, s?: Session): TabInfo {
   return {
@@ -376,7 +366,6 @@ export const handlers: Record<string, (s: Session, p: Params) => Promise<unknown
   async "tabs.list"(s, p) {
     await takeInterrupt(s);
     if (p.scope === "all") {
-      await ensureMayListTabs(s);
       // Only web tabs: browser pages cannot be claimed, so there is no reason to show them.
       const tabs = await chrome.tabs.query({ windowType: "normal" });
       return tabs.filter((t) => isWebUrl(t.url || t.pendingUrl || "")).map((t) => tabInfo(t, s));
@@ -385,7 +374,7 @@ export const handlers: Record<string, (s: Session, p: Params) => Promise<unknown
     return tabs.filter(Boolean).map((t) => tabInfo(t!, s));
   },
 
-  // No approval step: if the extension is connected, the tab simply opens, inside this
+  // No permission prompt: if the extension is connected, the tab simply opens, inside this
   // thread's tab group. Every wait below is bounded, so the agent gets an answer well before
   // the daemon gives up on the call.
   async "tabs.open"(s, p) {
@@ -421,7 +410,6 @@ export const handlers: Record<string, (s: Session, p: Params) => Promise<unknown
     if (owner && owner.id !== s.id) throw new ActionError("Another T3 thread is already using that tab.", "ownership_conflict");
     const url = tab.url || tab.pendingUrl || "";
     if (!isWebUrl(url)) throw new ActionError(notWebPageMessage(url), "restricted");
-    if (!owner) await ensureMayClaim(s, tab);
     await addTab(s, tabId);
     await attach(tabId);
     await showOverlay(tabId, s);
@@ -744,7 +732,6 @@ export const handlers: Record<string, (s: Session, p: Params) => Promise<unknown
     const tabId = Number(p.tabId);
     const tab = await prepare(s, tabId);
     const files: string[] = (Array.isArray(p.files) ? p.files : [p.files]).map(String);
-    await ensureMayUpload(s, originOf(tab.url ?? ""), files);
     await send(tabId, "DOM.setFileInputFiles", { files, backendNodeId: resolveRef(tabId, p.ref).backendNodeId });
     return { ...(await pageState(tabId)), uploaded: files };
   },
@@ -774,6 +761,12 @@ export const handlers: Record<string, (s: Session, p: Params) => Promise<unknown
     return { released: true };
   },
 
+  /** Load the build that is on disk now (used by `t3-browser reload-extension` after a rebuild). */
+  async "extension.reload"() {
+    setTimeout(() => chrome.runtime.reload(), 150);
+    return { reloading: true, version: chrome.runtime.getManifest().version };
+  },
+
   // ---- CDP relay (agent-browser `connect`) --------------------------------------------
 
   async "cdp.attach"(s, p) {
@@ -794,7 +787,6 @@ export const handlers: Record<string, (s: Session, p: Params) => Promise<unknown
     assertOwnsTab(s, tabId);
     const method = String(p.method);
     if (method === "Page.navigate" && p.params?.url) assertWebUrl(String(p.params.url));
-    if (method === "DOM.setFileInputFiles") await ensureMayUpload(s, originOf((await chrome.tabs.get(tabId)).url ?? ""), p.params?.files ?? []);
     if (!isAttached(tabId)) await attach(tabId);
     try {
       return await send(tabId, method, p.params, p.childSessionId);

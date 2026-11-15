@@ -38,13 +38,6 @@ button.small { padding: 3px 8px; font-size: 12px; }
 button[disabled] { opacity: .45; cursor: default; }
 kbd { font: 600 11px ui-monospace, monospace; border: 1px solid var(--line); border-radius: 4px; padding: 1px 4px; }
 
-/* approval window */
-.approve main { padding: 18px 20px; }
-.approve p { font-size: 13px; margin: 0; }
-.approve h1 { overflow-wrap: anywhere; }
-.approve pre { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; max-height: 90px; overflow: auto; white-space: pre-wrap; font-size: 12px; }
-.actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 18px; flex-wrap: wrap; }
-.approve p.hint { font-size: 12px; color: var(--muted); margin-top: 16px; }
 
 /* popup */
 .popup { width: 340px; }

@@ -18,6 +18,7 @@
   },
   "scripts": {
     "build": "node scripts/build.mjs",
+    "reload": "node scripts/build.mjs && node dist/cli.js reload-extension",
     "dev": "node scripts/build.mjs --watch",
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p extension/tsconfig.json",
     "test": "vitest run",

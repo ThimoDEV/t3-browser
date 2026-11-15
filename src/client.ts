@@ -26,6 +26,11 @@ async function healthy(port: number): Promise<boolean> {
   }
 }
 
+/** True when a daemon answers on the port; never starts one. */
+export function isDaemonRunning(port = PORT): Promise<boolean> {
+  return healthy(port);
+}
+
 export async function ensureDaemon(port = PORT): Promise<void> {
   if (await healthy(port)) return;
   ensureHome();

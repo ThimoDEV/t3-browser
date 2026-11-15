@@ -20,7 +20,7 @@ const watch = process.argv.includes("--watch");
 }
 const extOut = join(root, "extension", "dist");
 
-const define = { __VERSION__: JSON.stringify(pkg.version) };
+const define = { __VERSION__: JSON.stringify(pkg.version), __BUILD_ID__: JSON.stringify(Date.now().toString(36)) };
 
 const cliOptions = {
   entryPoints: [join(root, "src", "cli.ts")],
@@ -37,7 +37,7 @@ const cliOptions = {
 };
 
 const extOptions = {
-  entryPoints: ["background", "offscreen", "overlay", "popup", "approve"].map((n) => join(root, "extension", "src", `${n}.ts`)),
+  entryPoints: ["background", "offscreen", "overlay", "popup"].map((n) => join(root, "extension", "src", `${n}.ts`)),
   outdir: extOut,
   bundle: true,
   format: "iife",

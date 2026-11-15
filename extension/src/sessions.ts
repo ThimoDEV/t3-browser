@@ -2,9 +2,10 @@
 // interruptions. Persisted in chrome.storage.session so a service-worker restart does not
 // forget which tabs an agent owns.
 //
-// There is no per-site approval: if the extension is installed and connected, agents may
-// use any web page (http/https) in their own tab group. Browser pages are refused outright
-// (see urls.ts). The user can still press Esc or Stop at any time to take control back.
+// There are no permission prompts: if the extension is installed and connected, agents may
+// use any web page (http/https) in their own tab group, see the user's web tabs and take one
+// over. Browser pages are refused outright (see urls.ts). The user can press Esc or Stop at
+// any time to take control back.
 
 import type { SessionInfo } from "../../src/protocol";
 import { isUsableTabUrl, isWebUrl, notWebPageMessage } from "./urls";
@@ -16,8 +17,6 @@ export interface Session {
   named?: boolean;
   groupId?: number;
   tabIds: number[];
-  /** The user has allowed this thread to list all their open tabs. */
-  mayListAllTabs?: boolean;
   /** Set by Esc / Stop; reported to the agent once, then cleared. */
   interrupted?: string;
   createdAt: number;
@@ -230,113 +229,4 @@ export function assertWebUrl(url: string): void {
 export function assertUsableTab(tab: chrome.tabs.Tab): void {
   const url = tab.url || tab.pendingUrl || "";
   if (!isUsableTabUrl(url)) throw new ActionError(notWebPageMessage(url), "restricted");
-}
-
-// ---------------------------------------------------------------------------------------
-// Confirmations that remain: listing all the user's tabs, taking over a tab the user opened,
-// and uploading local files. (Sites themselves need no approval.)
-
-export interface ApprovalRequest {
-  id: string;
-  sessionTitle: string;
-  kind: "tabs" | "upload" | "claim";
-  origin?: string;
-  detail?: string;
-}
-
-type Decision = "once" | "deny" | "timeout";
-const pendingApprovals = new Map<string, { req: ApprovalRequest; resolve: (d: Decision) => void; windowId?: number }>();
-const approvalDedup = new Map<string, Promise<Decision>>();
-
-/**
- * How long a prompt waits for the user. Must stay well below the daemon's request timeout
- * (120s) so the agent gets a clear answer instead of "Timed out waiting for Chrome".
- */
-const APPROVAL_TIMEOUT_MS = 90_000;
-
-export function getApproval(id: string): ApprovalRequest | undefined {
-  return pendingApprovals.get(id)?.req;
-}
-
-export function resolveApproval(id: string, decision: Decision): void {
-  const p = pendingApprovals.get(id);
-  if (!p) return;
-  pendingApprovals.delete(id);
-  p.resolve(decision);
-  if (p.windowId !== undefined) chrome.windows.remove(p.windowId).catch(() => {});
-}
-
-chrome.windows.onRemoved.addListener((windowId) => {
-  for (const [id, p] of pendingApprovals) if (p.windowId === windowId) resolveApproval(id, "deny");
-});
-
-async function askUser(req: Omit<ApprovalRequest, "id">, dedupKey: string): Promise<Decision> {
-  const existing = approvalDedup.get(dedupKey);
-  if (existing) return existing;
-  const id = crypto.randomUUID();
-  const promise = new Promise<Decision>((resolve) => {
-    pendingApprovals.set(id, { req: { ...req, id }, resolve });
-  });
-  approvalDedup.set(dedupKey, promise);
-  promise.finally(() => approvalDedup.delete(dedupKey));
-  const timeout = setTimeout(() => resolveApproval(id, "timeout"), APPROVAL_TIMEOUT_MS);
-  promise.finally(() => clearTimeout(timeout));
-
-  const last = await chrome.windows.getLastFocused().catch(() => undefined);
-  const width = 440;
-  const height = 330;
-  const base = { url: chrome.runtime.getURL(`approve.html?id=${id}`), type: "popup" as const, width, height, focused: true };
-  // Top-right of the user's current window; Chrome rejects positions that end up off-screen
-  // (multi-monitor setups, headless), so fall back to its default placement.
-  const win = await chrome.windows
-    .create({
-      ...base,
-      left: last?.left !== undefined && last.width ? Math.max(0, last.left + last.width - width - 24) : undefined,
-      top: last?.top !== undefined ? Math.max(0, last.top + 80) : undefined,
-    })
-    .catch(() => chrome.windows.create(base).catch(() => undefined));
-  if (win?.id === undefined) {
-    resolveApproval(id, "deny");
-    return promise;
-  }
-  const p = pendingApprovals.get(id);
-  if (p) p.windowId = win.id;
-  // When another app has focus (e.g. T3 Code), Windows will not raise the prompt; at least
-  // flash it in the taskbar.
-  chrome.windows.update(win.id, { focused: true, drawAttention: true }).catch(() => {});
-  return promise;
-}
-
-function refusal(d: Decision, what: string): ActionError | undefined {
-  if (d === "timeout") {
-    return new ActionError(
-      `The user did not answer the T3 Browser prompt (${what}) within ${APPROVAL_TIMEOUT_MS / 1000}s. Ask the user in chat, then try again.`,
-      "no_answer",
-    );
-  }
-  if (d === "deny") return new ActionError(`The user said no (${what}).`, "denied");
-  return undefined;
-}
-
-export async function ensureMayListTabs(s: Session): Promise<void> {
-  if (s.mayListAllTabs) return;
-  const e = refusal(await askUser({ sessionTitle: s.title, kind: "tabs" }, `tabs:${s.id}`), "seeing their open tabs");
-  if (e) throw e;
-  s.mayListAllTabs = true;
-  await save();
-}
-
-export async function ensureMayClaim(s: Session, tab: chrome.tabs.Tab): Promise<void> {
-  const d = await askUser(
-    { sessionTitle: s.title, kind: "claim", origin: new URL(tab.url!).origin, detail: tab.title },
-    `claim:${s.id}:${tab.id}`,
-  );
-  const e = refusal(d, "handing over that tab");
-  if (e) throw e;
-}
-
-export async function ensureMayUpload(s: Session, origin: string, files: string[]): Promise<void> {
-  const d = await askUser({ sessionTitle: s.title, kind: "upload", origin, detail: files.join("\n") }, `upload:${s.id}:${files.join("|")}`);
-  const e = refusal(d, "uploading those files");
-  if (e) throw e;
 }
