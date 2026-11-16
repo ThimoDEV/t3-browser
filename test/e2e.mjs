@@ -413,6 +413,9 @@ await step("links opening a new tab join the thread", async () => {
 });
 
 await step("Esc hands control back; the agent is told once", async () => {
+  // The user is looking at the tab (a hidden tab cannot receive their keystrokes).
+  await inExtension(`chrome.tabs.update(${tab}, { active: true }).then(() => true)`);
+  await sleep(300);
   const { targetInfos } = await user.send("Target.getTargets");
   const page = targetInfos.find((t) => t.type === "page" && t.url.endsWith("/form.html"));
   const { sessionId } = await user.send("Target.attachToTarget", { targetId: page.targetId, flatten: true });

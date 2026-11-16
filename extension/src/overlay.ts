@@ -66,6 +66,8 @@ declare const __BUILD_ID__: string;
         animation: breathe 2.4s ease-in-out infinite;
       }
       @keyframes breathe { 50% { box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--t3) 65%, transparent), inset 0 0 40px 8px color-mix(in srgb, var(--t3) 22%, transparent); } }
+      /* Nobody can click the pill in a hidden tab: let the agent's clicks pass through it. */
+      :host(.hidden-tab) .pill { pointer-events: none; }
       .pill {
         position: fixed; left: 50%; bottom: 18px; transform: translateX(-50%);
         display: flex; align-items: center; gap: 10px;
@@ -146,13 +148,18 @@ declare const __BUILD_ID__: string;
   window.addEventListener(
     "keydown",
     (e) => {
-      if (!visible || e.key !== "Escape" || !e.isTrusted) return;
+      // A hidden tab cannot have the user's keystrokes: an Escape there is the agent's own key.
+      if (!visible || document.hidden || e.key !== "Escape" || !e.isTrusted) return;
       // The agent itself may press Escape through CDP; those presses are announced first.
       if (Date.now() < escSuppressedUntil) return;
       interrupt("escape");
     },
     true,
   );
+
+  const trackVisibility = () => host.classList.toggle("hidden-tab", document.hidden);
+  trackVisibility();
+  document.addEventListener("visibilitychange", trackVisibility);
 
   const mount = () => {
     if (!host.isConnected) (document.documentElement ?? document.body)?.appendChild(host);

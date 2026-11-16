@@ -134,10 +134,44 @@ async function waitForLoad(tabId: number, timeoutMs = 15_000): Promise<void> {
 type OverlayFn = "show" | "hide" | "moveTo" | "click" | "activity" | "agentActing";
 
 async function overlay(tabId: number, fn: OverlayFn, ...args: unknown[]): Promise<void> {
+  // Chrome runs extension scripts in hidden tabs (background tabs, or the whole window covered
+  // by another app) very slowly: 1.5-3s per call measured in Chrome 157, on every agent action.
+  // So in hidden tabs nothing here makes the agent wait; syncOverlay() puts the cursor where it
+  // belongs when the tab comes into view.
+  const visible = await maybeVisible(tabId);
+  if (fn === "hide" || (fn === "show" && !visible)) {
+    // Never wait for these in a hidden tab, but always do them: "show" puts the Esc listener in
+    // place (the user may look at the tab without any event telling us), "hide" removes a
+    // stale overlay. The overlay itself ignores Escape and lets clicks through while hidden.
+    void withDeadline(overlayNow(tabId, fn, args), 3_000, "Updating the overlay").catch(() => {});
+    return;
+  }
+  // The cursor, its tag and the click ripple only matter to someone watching.
+  if (!visible) return;
   // executeScript waits for the document to become idle, which a slow page (a dev server
   // compiling its first request) may not reach for a long time. The overlay is shown again
   // when the page finishes loading, so give up quickly here.
   await withDeadline(overlayNow(tabId, fn, args), 3_000, "Showing the overlay").catch(() => {});
+}
+
+/** Can the user see this tab? Asks the page when we are attached (fast), else Chrome. */
+async function maybeVisible(tabId: number): Promise<boolean> {
+  if (isAttached(tabId)) return pageVisible(tabId);
+  const tab = await chrome.tabs.get(tabId).catch(() => undefined);
+  if (!tab?.active) return false;
+  const win = await chrome.windows.get(tab.windowId).catch(() => undefined);
+  return win?.state !== "minimized";
+}
+
+/**
+ * The tab came into view (the user switched to it, or brought the window back): show the
+ * overlay as it should be and put the cursor where the agent last acted.
+ */
+export async function syncOverlay(tabId: number, s: Session): Promise<void> {
+  if (!overlayShown.has(tabId) || s.interrupted) return;
+  await showOverlay(tabId, s);
+  const at = pointers.get(tabId);
+  if (at) await overlay(tabId, "moveTo", at.x, at.y, at, null);
 }
 
 async function overlayNow(tabId: number, fn: string, args: unknown[]): Promise<void> {
@@ -315,7 +349,10 @@ async function mouseClick(tabId: number, x: number, y: number, button = "left", 
   await glideTo(tabId, x, y, activity);
   await overlay(tabId, "agentActing", 800);
   await overlay(tabId, "click", x, y);
-  await send(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
+  // In a tab the user can see, move the mouse there first like a person would (hover styles,
+  // pointerenter). In a hidden tab Chrome holds mouse moves for 1-5s (they wait for a frame
+  // that never comes), while presses and releases go straight through and carry the position.
+  if (await pageVisible(tabId)) await send(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
   for (let i = 1; i <= clickCount; i++) {
     await unlessDialog(tabId, send(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", x, y, button, clickCount: i }));
     if (dialogs.has(tabId)) return;
@@ -599,7 +636,12 @@ export const handlers: Record<string, (s: Session, p: Params) => Promise<unknown
     await prepare(s, tabId);
     const { x, y } = await clickablePoint(tabId, resolveRef(tabId, p.ref).backendNodeId);
     await glideTo(tabId, x, y);
-    await send(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
+    // Here the move is the action itself. In a hidden tab Chrome delivers it late (1-5s, see
+    // mouseClick): wait for it, but not for ever.
+    const moved = send(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
+    moved.catch(() => {});
+    if (await pageVisible(tabId)) await moved;
+    else await Promise.race([moved, sleep(1_500)]);
     return pageState(tabId);
   },
 

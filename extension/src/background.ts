@@ -3,7 +3,7 @@
 
 import type { EventMessage, RequestMessage, ResponseMessage } from "../../src/protocol";
 import { detach, detachIdle, idleTabs, isAttached, onCdpEvent, onDetach, wasIdleDetached } from "./cdp";
-import { dispatch, forgetTab, hasDialog, hideOverlay, onDialog, onStopRequest, onTabNavigated, ownActivations, relayTabs, showOverlay } from "./commands";
+import { dispatch, forgetTab, hasDialog, hideOverlay, onDialog, onStopRequest, onTabNavigated, ownActivations, relayTabs, showOverlay, syncOverlay } from "./commands";
 import {
   ActionError,
   addTab,
@@ -304,6 +304,20 @@ chrome.tabs.onActivated.addListener(({ tabId, windowId }) => {
   if (before !== undefined && before !== tabId) previousTab.set(windowId, before);
   activeTab.set(windowId, tabId);
   void keepUserInFront(tabId, windowId, before);
+  void syncIfAgentTab(tabId);
+});
+
+/** Overlays are skipped in hidden tabs: catch up when an agent's tab comes into view. */
+async function syncIfAgentTab(tabId: number): Promise<void> {
+  const s = await sessionForTab(tabId);
+  if (s) await syncOverlay(tabId, s);
+}
+// The window came back to the front (it was covered or minimized): its tab is visible again.
+chrome.windows.onFocusChanged.addListener((windowId) => {
+  if (windowId === chrome.windows.WINDOW_ID_NONE) return;
+  void chrome.tabs.query({ active: true, windowId }).then(async ([t]) => {
+    if (t?.id !== undefined) await syncIfAgentTab(t.id);
+  });
 });
 
 chrome.webNavigation.onCreatedNavigationTarget.addListener((d) => {
