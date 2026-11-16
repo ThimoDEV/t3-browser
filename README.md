@@ -9,7 +9,7 @@ Let [T3 Code](https://github.com/pingdotgg/t3code) agents use your browser.
 - **Web pages only.** http and https, localhost included. Browser pages, extension pages, local files and the Chrome Web Store are refused with a clear `[restricted]` error.
 - **A visible agent cursor.** In a tab you're watching, a purple "T3 Code" cursor glides to each element and shows the click or "Typing…" before the real input is sent.
 - **No silent hangs.** Opening a tab can no longer wait on an unseen prompt until the bridge times out.
-- **Self-updating extension.** `npm run reload` builds and makes the connected Chrome load the new extension, no trip to `chrome://extensions`.
+- **Self-updating extension.** `pnpm reload` builds and makes the connected Chrome load the new extension, no trip to `chrome://extensions`.
 - **Agents on other machines.** An agent on a VPS or a linked T3 Code environment can use the Chrome on your desk, over Tailscale or an SSH tunnel. See [Use it from another machine](#use-it-from-another-machine).
 - **A control page for your phone.** What each thread is doing in Chrome, a peek at its tabs, and Stop. See [Control page](#control-page).
 - **Quiet when idle.** Chrome's "started debugging this browser" bar goes away once an agent has been idle for a minute, and comes back when it acts again.
@@ -43,13 +43,13 @@ T3 Code thread ─▶ Claude Code / Codex / Cursor
 
 ## Install
 
-Requires Node 20+ and Chrome (or Edge, Brave and other Chromium browsers).
+Requires Node 20+, [pnpm](https://pnpm.io/installation) and Chrome (or Edge, Brave and other Chromium browsers).
 
 ```sh
 git clone https://github.com/ThimoDEV/t3-browser
 cd t3-browser
-npm install
-npm run build
+pnpm install
+pnpm build
 node dist/cli.js install        # registers the MCP server + skill with claude, codex and cursor
 ```
 
@@ -59,7 +59,7 @@ Then load the extension once:
 2. Click **Load unpacked** and pick the `extension/dist` folder (`node dist/cli.js extension-path` prints it).
 3. Pin **T3 Browser** to the toolbar. Its popup shows connection status, each thread with its number and colour, and **Show** / **Stop** buttons. On an agent's tab the icon's badge shows that thread's number.
 
-After pulling a new version, run `npm run reload`: it builds and tells the connected Chrome to load the new extension. (Builds from before this command need one manual click on the reload icon in `chrome://extensions`.)
+After pulling a new version, run `pnpm reload`: it builds and tells the connected Chrome to load the new extension. (Builds from before this command need one manual click on the reload icon in `chrome://extensions`.)
 
 Start a **new** thread in T3 Code (MCP servers load when a session starts) and ask something like *"check my GitHub notifications and summarise the ones about t3code"*.
 
@@ -71,7 +71,7 @@ Start a **new** thread in T3 Code (MCP servers load when a session starts) and a
 | --- | --- |
 | `node dist/cli.js install` | Register the MCP server and skill with Claude Code, Codex and Cursor |
 | `node dist/cli.js doctor` | Check the daemon and the extension, and show how long calls into Chrome take |
-| `npm run reload` | Build, then make the connected Chrome load the new extension |
+| `pnpm reload` | Build, then make the connected Chrome load the new extension |
 | `node dist/cli.js control` | Print the link to the control page (open it on your phone over Tailscale) |
 | `node dist/cli.js remote --listen <ip>` | Let agents on other machines use the Chrome on this machine |
 | `node dist/cli.js remote-link <url>` | On an agent machine: use the Chrome on another machine (asks for the token) |
@@ -147,12 +147,12 @@ The server also sends usage and safety instructions in its MCP `initialize` resp
 ## Development
 
 ```sh
-npm run dev          # rebuild CLI + extension on change (reload the extension in chrome://extensions)
-npm run reload       # build, then make the connected Chrome load the new extension build
-npm run typecheck
-npm test             # unit tests: snapshot formatter, keys, daemon auth + routing
-npx @puppeteer/browsers install chrome@stable --path .cache/browsers
-npm run test:e2e     # real Chrome for Testing + extension + daemon + MCP, end to end (HEADED=1 to watch)
+pnpm dev             # rebuild CLI + extension on change (reload the extension in chrome://extensions)
+pnpm reload          # build, then make the connected Chrome load the new extension build
+pnpm typecheck
+pnpm test            # unit tests: snapshot formatter, keys, daemon auth + routing
+pnpm dlx @puppeteer/browsers install chrome@stable --path .cache/browsers
+pnpm test:e2e        # real Chrome for Testing + extension + daemon + MCP, end to end (HEADED=1 to watch)
 ```
 
 The e2e suite runs the whole chain through an MCP client and fails if the extension ever opens a prompt window. It covers opening into the thread's tab group, claiming the user's tab, refusing non-web pages, Esc takeover, dialogs, iframes, covered elements, background-tab screenshots, new-tab adoption, the agent-browser CDP relay and the isolated browser.

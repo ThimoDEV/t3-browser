@@ -89,7 +89,7 @@ export class IsolatedBrowser {
             }
           }
           if (err) {
-            const hint = /ENOENT/.test(String(err)) ? " (is agent-browser installed? `npm i -g agent-browser`)" : "";
+            const hint = /ENOENT/.test(String(err)) ? " (is agent-browser installed? `pnpm add -g agent-browser`)" : "";
             return reject(new IsolatedError(`agent-browser failed: ${(stderr || err.message).trim()}${hint}`));
           }
           resolve(undefined as T);

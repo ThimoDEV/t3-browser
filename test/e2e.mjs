@@ -3,8 +3,8 @@
 // plays the user (pressing Esc, opening tabs) and checks that no extension window ever pops up:
 // there are no permission prompts.
 //
-//   npx @puppeteer/browsers install chrome@stable --path .cache/browsers
-//   npm run test:e2e            (HEADED=1 to watch)
+//   pnpm dlx @puppeteer/browsers install chrome@stable --path .cache/browsers
+//   pnpm test:e2e               (HEADED=1 to watch)
 
 import assert from "node:assert/strict";
 import { spawn, execFile } from "node:child_process";
@@ -87,7 +87,7 @@ class Cdp {
 // ---- setup -----------------------------------------------------------------------------
 const exe = findChrome();
 if (!exe) {
-  console.error("Chrome for Testing not found. Run: npx @puppeteer/browsers install chrome@stable --path .cache/browsers");
+  console.error("Chrome for Testing not found. Run: pnpm dlx @puppeteer/browsers install chrome@stable --path .cache/browsers");
   process.exit(2);
 }
 

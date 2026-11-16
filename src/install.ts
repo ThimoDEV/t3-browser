@@ -67,7 +67,7 @@ function installCursor(): string {
 }
 
 export function install(targets: Target[]): string[] {
-  if (!existsSync(CLI_PATH)) throw new Error(`Build first: ${CLI_PATH} is missing (run \`npm run build\`).`);
+  if (!existsSync(CLI_PATH)) throw new Error(`Build first: ${CLI_PATH} is missing (run \`pnpm build\`).`);
   const out: string[] = [];
   for (const t of targets) {
     try {
