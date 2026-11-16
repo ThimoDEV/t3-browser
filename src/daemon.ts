@@ -293,16 +293,22 @@ export class Daemon {
       if (req.headers["x-t3-browser"] !== "1" || (origin && origin !== `http://${req.headers.host}`)) return json(403, { error: "forbidden" });
       const body = (await readJson(req)) as { session?: string; tabId?: number };
       if (url.pathname === "/control/stop") {
+        // Without Chrome nothing can be stopped: say so at once instead of waiting for it per thread.
+        if (this.extension?.readyState !== WebSocket.OPEN) {
+          return json(200, { stopped: [], error: "Chrome is not connected to T3 Browser, so nothing was stopped." });
+        }
         const targets = body.session ? [body.session] : [...this.activeSessions.keys()];
         const stopped: string[] = [];
+        let failure: string | undefined;
         for (const id of targets) {
           const info = this.activeSessions.get(id);
           if (!info) continue;
           const r = await this.forward(info, "session.stop", {});
           this.activity.record(info, "session.stop", {}, !r.error, 0);
           if (!r.error) stopped.push(id);
+          else failure ??= r.error.message;
         }
-        return json(200, { stopped });
+        return json(200, failure ? { stopped, error: failure } : { stopped });
       }
       const info = body.session ? this.activeSessions.get(body.session) : undefined;
       if (!info) return json(404, { error: "That thread has no tabs any more." });

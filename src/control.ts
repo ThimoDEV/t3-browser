@@ -175,12 +175,28 @@ export const CONTROL_JS = `(() => {
     const d = $("#peek"); d.querySelector("img").src = "data:" + r.mimeType + ";base64," + r.data; d.showModal();
   }
 
+  // What the page last showed: Stop all must stop every thread it showed as running.
+  let shown = [];
+  const UNREACHABLE = { stopped: [], error: "Could not reach T3 Browser on your computer." };
+
+  /** Stop threads; tell the user plainly about any that did not stop. */
+  async function stop_(body, expected) {
+    const r = await post("/control/stop", body).catch(() => UNREACHABLE);
+    const stopped = Array.isArray(r.stopped) ? r.stopped : [];
+    const missed = expected.filter((t) => !stopped.includes(t.id));
+    if (missed.length) {
+      alert("Could not stop " + missed.map((t) => "\u201c" + t.title + "\u201d").join(", ") + ". " + (r.error || "Is Chrome connected?") + " Press Esc in the agent's tab, or close it.");
+    }
+    render();
+  }
+
   async function render() {
     let state;
     try { state = await (await fetch("/control/state")).json(); } catch { $("#conn").textContent = "daemon unreachable"; $("#conn").className = "status"; return; }
     if (state.error) { location.reload(); return; }
     $("#conn").textContent = state.extensionConnected ? "Chrome connected" : "Chrome not connected";
     $("#conn").className = "status" + (state.extensionConnected ? " on" : "");
+    shown = state.threads;
     $("#stop-all").hidden = !state.threads.some((t) => t.controlling);
     const main = $("#threads"); main.replaceChildren();
     if (!state.threads.length) main.append(el("p", { class: "muted" }, "No agent has used the browser since the daemon started."));
@@ -189,9 +205,7 @@ export const CONTROL_JS = `(() => {
       const stop = el("button", { class: "danger small" }, "Stop");
       stop.onclick = async () => {
         stop.disabled = true;
-        const r = await post("/control/stop", { session: t.id }).catch(() => ({ stopped: [] }));
-        if (!r.stopped || !r.stopped.includes(t.id)) alert("Could not stop it: is Chrome connected? Press Esc in the agent's tab instead.");
-        render();
+        await stop_({ session: t.id }, [t]);
       };
       if (!t.controlling) stop.hidden = true;
       const tabs = el("ul");
@@ -207,7 +221,11 @@ export const CONTROL_JS = `(() => {
     }
   }
 
-  $("#stop-all").onclick = async () => { await post("/control/stop", {}); render(); };
+  $("#stop-all").onclick = async () => {
+    $("#stop-all").disabled = true;
+    await stop_({}, shown.filter((t) => t.controlling));
+    $("#stop-all").disabled = false;
+  };
   render();
   setInterval(render, 2000);
 })();`;

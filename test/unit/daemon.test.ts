@@ -364,6 +364,22 @@ describe("control page", () => {
     ext.close();
   });
 
+  it("answers Stop all at once, stopping nothing, when Chrome is not connected", async () => {
+    const ext = await fakeExtensionWithTab();
+    const client = await connect("/client", { authorization: `Bearer ${daemon.token}` });
+    const answered = next(client);
+    client.send(JSON.stringify({ type: "request", id: 1, session: { id: "ctl-off", title: "T" }, method: "tabs.open", params: { url: "https://x.example" } }));
+    await answered;
+    ext.close();
+    await extensionGone();
+    const cookie = await signIn();
+    const started = Date.now();
+    const res = await http("/control/stop", { method: "POST", headers: { cookie, "x-t3-browser": "1", origin: `http://127.0.0.1:${PORT}`, host: `127.0.0.1:${PORT}` }, body: "{}" });
+    expect(Date.now() - started).toBeLessThan(1_000); // not the 20s wait for Chrome, per thread
+    expect(JSON.parse(res.body)).toEqual({ stopped: [], error: "Chrome is not connected to T3 Browser, so nothing was stopped." });
+    client.close();
+  });
+
   it("stops a thread, but only for a same-origin request from the page", async () => {
     const ext = await fakeExtensionWithTab();
     const client = await connect("/client", { authorization: `Bearer ${daemon.token}` });

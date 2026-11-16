@@ -773,6 +773,48 @@ await step("two threads screenshotting background tabs at once leave the user's 
   assert.equal(await activeTabId(), userTab, "the user's tab is in front again");
 });
 
+await step("the control page names every thread that Stop all could not stop", async () => {
+  const token = readFileSync(join(tmp, "home", "token"), "utf8").trim();
+  const { targetId } = await user.send("Target.createTarget", { url: `http://127.0.0.1:${PORT}/control?token=${token}` });
+  const evalPage = async (expr) => {
+    for (let i = 0; ; i++) {
+      try {
+        return await user.evalIn(targetId, expr);
+      } catch (e) {
+        if (i >= 30 || !/context was destroyed|Cannot find context/.test(e.message)) throw e;
+        await sleep(100);
+      }
+    }
+  };
+  try {
+    // Wait for both running threads, then answer Stop all as if only thread #1 stopped.
+    await evalPage(`new Promise((resolve) => { const t = setInterval(() => { if (document.querySelectorAll("section.thread").length >= 2 && !document.getElementById("stop-all").hidden) { clearInterval(t); resolve(true); } }, 100); })`);
+    const message = await evalPage(`new Promise((resolve) => {
+      const real = window.fetch;
+      window.fetch = (url, opts) => url === "/control/stop"
+        ? Promise.resolve(new Response(JSON.stringify({ stopped: ["e2e-thread"], error: "Chrome did not answer." })))
+        : real(url, opts);
+      window.alert = (m) => resolve(m);
+      setTimeout(() => resolve("(no alert)"), 5000);
+      document.getElementById("stop-all").click();
+    })`);
+    assert.match(message, /Could not stop “Second thread”/);
+    assert.doesNotMatch(message, /Signup test/, "the thread that did stop is not listed");
+    assert.match(message, /Chrome did not answer\./, "the daemon's reason is shown");
+    // And when the daemon cannot be reached at all, Stop all says so instead of nothing.
+    const offline = await evalPage(`new Promise((resolve) => {
+      window.fetch = (url, opts) => (url === "/control/stop" ? Promise.reject(new TypeError("Failed to fetch")) : Promise.resolve(new Response("{}")));
+      window.alert = (m) => resolve(m);
+      setTimeout(() => resolve("(no alert)"), 5000);
+      document.getElementById("stop-all").disabled = false;
+      document.getElementById("stop-all").click();
+    })`);
+    assert.match(offline, /Could not reach T3 Browser/);
+  } finally {
+    await user.send("Target.closeTarget", { targetId });
+  }
+});
+
 await step("a popup from an agent's background tab does not take over the user's screen", async () => {
   await call("browser_navigate", { tab, url: `${site}/form.html` });
   // Some history first: the user was on another tab X, then came to U.
