@@ -1,7 +1,7 @@
 // Implementation of every method the daemon can call. Each handler receives the calling
 // thread's Session and validated-ish params, and returns JSON (screenshots as base64).
 
-import type { SessionInfo, TabInfo } from "../../src/protocol";
+import type { ResponseMessage, SessionInfo, TabInfo } from "../../src/protocol";
 import { attach, busyCount, detach, detachIdle, isAttached, markBusy, onDocumentReplaced, send } from "./cdp";
 import { parseKey } from "./keys";
 import {
@@ -10,18 +10,22 @@ import {
   assertOwnsTab,
   assertUsableTab,
   assertWebUrl,
+  clearHandback,
   dropSession,
+  handedBack,
   getSession,
   persist,
   placeForNewTab,
   renameSession,
   sessionForTab,
+  setHandback,
   takeInterrupt,
   threadColorHex,
   threadInk,
   unmarkTab,
   type Session,
 } from "./sessions";
+import { handbackMessage, NOTE_MAX } from "./handback";
 import { threadGroupTitle } from "./identity";
 import { createQueue } from "./serial";
 import { formatAXTree, RefAllocator, type AXNode } from "./snapshot";
@@ -131,7 +135,7 @@ async function waitForLoad(tabId: number, timeoutMs = 15_000): Promise<void> {
   }
 }
 
-type OverlayFn = "show" | "hide" | "moveTo" | "click" | "activity" | "agentActing";
+type OverlayFn = "show" | "hide" | "moveTo" | "click" | "activity" | "agentActing" | "yourTurn" | "handedBack";
 
 async function overlay(tabId: number, fn: OverlayFn, ...args: unknown[]): Promise<void> {
   // Chrome runs extension scripts in hidden tabs (background tabs, or the whole window covered
@@ -139,7 +143,9 @@ async function overlay(tabId: number, fn: OverlayFn, ...args: unknown[]): Promis
   // So in hidden tabs nothing here makes the agent wait; syncOverlay() puts the cursor where it
   // belongs when the tab comes into view.
   const visible = await maybeVisible(tabId);
-  if (fn === "hide" || (fn === "show" && !visible)) {
+  // The user's turn (and its "sent" confirmation) must reach the page even in a hidden tab.
+  const always = fn === "show" || fn === "yourTurn" || fn === "handedBack";
+  if (fn === "hide" || (always && !visible)) {
     // Never wait for these in a hidden tab, but always do them: "show" puts the Esc listener in
     // place (the user may look at the tab without any event telling us), "hide" removes a
     // stale overlay. The overlay itself ignores Escape and lets clicks through while hidden.
@@ -168,6 +174,7 @@ async function maybeVisible(tabId: number): Promise<boolean> {
  * overlay as it should be and put the cursor where the agent last acted.
  */
 export async function syncOverlay(tabId: number, s: Session): Promise<void> {
+  if (s.handback?.tabId === tabId) return showYourTurn(tabId, s);
   if (!overlayShown.has(tabId) || s.interrupted) return;
   await showOverlay(tabId, s);
   const at = pointers.get(tabId);
@@ -176,7 +183,7 @@ export async function syncOverlay(tabId: number, s: Session): Promise<void> {
 
 async function overlayNow(tabId: number, fn: string, args: unknown[]): Promise<void> {
   try {
-    if (fn === "show") {
+    if (fn === "show" || fn === "yourTurn") {
       await chrome.scripting.executeScript({ target: { tabId }, files: ["overlay.js"] });
     }
     await chrome.scripting.executeScript({
@@ -224,6 +231,46 @@ export async function showOverlay(tabId: number, s: Session): Promise<void> {
   await overlay(tabId, "show", overlayLabel(s), !!s.link, threadColorHex(s), s.num ? `T3 #${s.num}` : "T3 Code", threadInk(s));
 }
 
+/**
+ * The user has the tab (Esc, Stop, or the agent handed it over): no frame or cursor, just a card
+ * with what the agent asked for, a note box and Hand back, and the link to the thread.
+ */
+export async function showYourTurn(tabId: number, s: Session): Promise<void> {
+  overlayShown.delete(tabId);
+  await overlay(tabId, "yourTurn", {
+    label: `T3 Code${s.num ? ` #${s.num}` : ""} · ${s.title}`,
+    hasLink: !!s.link,
+    color: threadColorHex(s),
+    ink: threadInk(s),
+    ask: s.handback?.ask ?? "",
+    // Without a T3 Code thread there is nowhere to post the note.
+    canSend: !!s.link,
+  });
+}
+
+let daemonAsk: ((info: SessionInfo, method: string, params: Record<string, unknown>) => Promise<ResponseMessage>) | undefined;
+/** The background registers how to ask the daemon something (through the offscreen socket). */
+export function onDaemonAsk(fn: typeof daemonAsk): void {
+  daemonAsk = fn;
+}
+
+/**
+ * Give the tab back to the agent: post the note to its T3 Code thread, then let it carry on
+ * (it is not told it was stopped: the note says what to do). Used by the page and the phone.
+ */
+export async function handBack(s: Session, note: string): Promise<{ sent: true }> {
+  const hb = s.handback;
+  if (!hb) throw new ActionError("The agent already has this tab back.", "no_handback");
+  if (!daemonAsk) throw new ActionError("T3 Browser is not connected to T3 Code.", "no_daemon");
+  const tab = await chrome.tabs.get(hb.tabId).catch(() => undefined);
+  const message = handbackMessage(hb.tabId, tab?.title, tab?.url, String(note ?? "").slice(0, NOTE_MAX));
+  const r = await daemonAsk({ id: s.id, title: s.title, ...(s.link ? { link: s.link } : {}) }, "thread.send", { message });
+  if (r.error) throw new ActionError(r.error.message, r.error.code);
+  await handedBack(s);
+  await overlay(hb.tabId, "handedBack", `Sent to T3 Code${s.num ? ` #${s.num}` : ""}. It takes it from here.`);
+  return { sent: true };
+}
+
 function overlayLabel(s: Session): string {
   return `T3 Code${s.num ? ` #${s.num}` : ""} is using this tab · ${s.title}`;
 }
@@ -248,6 +295,9 @@ export async function hideOverlay(tabId: number): Promise<void> {
 async function prepare(s: Session, tabId: number): Promise<chrome.tabs.Tab> {
   await takeInterrupt(s);
   assertOwnsTab(s, tabId);
+  // The agent acts in a tab the user had: it took the tab back (the user answered in chat).
+  const tookBack = s.handback?.tabId === tabId;
+  if (tookBack) await clearHandback(s);
   const tab = await chrome.tabs.get(tabId).catch(() => {
     throw new ActionError(`Tab ${tabId} no longer exists.`, "tab_closed");
   });
@@ -261,6 +311,8 @@ async function prepare(s: Session, tabId: number): Promise<chrome.tabs.Tab> {
   }
   if (!isAttached(tabId)) {
     await attach(tabId);
+    await showOverlay(tabId, s);
+  } else if (tookBack) {
     await showOverlay(tabId, s);
   }
   return tab;
@@ -472,7 +524,7 @@ export const handlers: Record<string, (s: Session, p: Params) => Promise<unknown
     const tabs = await Promise.all(s.tabIds.map((id) => chrome.tabs.get(id).catch(() => undefined)));
     const group = s.groupId === undefined ? undefined : await chrome.tabGroups.get(s.groupId).catch(() => undefined);
     return {
-      session: { id: s.id, title: s.title, link: s.link, num: s.num, color: s.color, groupId: group?.id, ...(group ? { group: { title: group.title, color: group.color, windowId: group.windowId } } : {}) },
+      session: { id: s.id, title: s.title, link: s.link, num: s.num, color: s.color, groupId: group?.id, handback: s.handback ?? null, ...(group ? { group: { title: group.title, color: group.color, windowId: group.windowId } } : {}) },
       tabs: tabs.filter(Boolean).map((t) => tabInfo(t!, s)),
       userAgent: navigator.userAgent,
     };
@@ -946,6 +998,35 @@ export const handlers: Record<string, (s: Session, p: Params) => Promise<unknown
     }
     await dropSession(s.id);
     return { released: true, kept };
+  },
+
+  /**
+   * The agent gives the user a tab for a step only they can do (log in, 2FA, a CAPTCHA). The
+   * debugger lets go, and the page shows the agent's request with Hand back.
+   */
+  async "session.handover"(s, p) {
+    await takeInterrupt(s);
+    const tabId = Number(p.tabId);
+    assertOwnsTab(s, tabId);
+    assertUsableTab(await chrome.tabs.get(tabId));
+    const ask = String(p.message ?? "").trim().slice(0, 300);
+    await setHandback(s, tabId, ask);
+    await detach(tabId);
+    relayTabs.delete(tabId);
+    if (s.groupId !== undefined) await chrome.tabGroups.update(s.groupId, { collapsed: false }).catch(() => {});
+    await showYourTurn(tabId, s);
+    return {
+      tab: tabId,
+      canHandBack: !!s.link,
+      next: s.link
+        ? "The tab shows your request with a Hand back button. Tell the user in chat what you need, then end your turn: when they hand the tab back, their note arrives in this thread as a new message."
+        : "The tab shows your request. This agent is not in a T3 Code thread, so the user will answer in chat.",
+    };
+  },
+
+  /** The control page's Hand back (the page's own button goes through the background). */
+  async "session.handback"(s, p) {
+    return handBack(s, String(p.note ?? ""));
   },
 
   /** Stop the thread as if the user pressed Stop (used by the remote control page). */

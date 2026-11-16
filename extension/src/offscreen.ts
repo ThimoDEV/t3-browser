@@ -2,7 +2,7 @@
 // service worker. Offscreen documents are not suspended, so the bridge reconnects within
 // a couple of seconds whenever T3 Code (re)starts the daemon.
 
-import { PROTOCOL_VERSION, type RequestMessage, type WireMessage } from "../../src/protocol";
+import { PROTOCOL_VERSION, type RequestMessage, type ResponseMessage, type WireMessage } from "../../src/protocol";
 
 const params = new URLSearchParams(location.search);
 const port = Number(params.get("port") ?? 47823);
@@ -13,6 +13,15 @@ const version = params.get("version") ?? "";
 let ws: WebSocket | null = null;
 let retryMs = 1000;
 let pingTimer: number | undefined;
+/** The extension's own requests to the daemon (EXTENSION_ASKS), by id, until it answers. */
+const asks = new Map<number, (res: ResponseMessage) => void>();
+let nextAsk = 1;
+const ASK_TIMEOUT_MS = 30_000;
+
+function failAsks(message: string): void {
+  for (const [id, done] of asks) done({ type: "response", id, error: { message, code: "no_daemon" } });
+  asks.clear();
+}
 
 function report(connected: boolean): void {
   chrome.runtime.sendMessage({ kind: "transport", connected }).catch(() => {});
@@ -45,6 +54,11 @@ function connect(): void {
     } catch {
       return;
     }
+    if (msg.type === "response") {
+      asks.get(msg.id)?.(msg);
+      asks.delete(msg.id);
+      return;
+    }
     if (msg.type !== "request") return;
     const response = await chrome.runtime.sendMessage({ kind: "rpc", msg: msg as RequestMessage }).catch((err: unknown) => ({
       type: "response",
@@ -56,6 +70,7 @@ function connect(): void {
 
   socket.onclose = () => {
     clearInterval(pingTimer);
+    failAsks("Lost the connection to T3 Browser. Tell the agent in its chat.");
     if (ws === socket) ws = null;
     report(false);
     setTimeout(connect, retryMs);
@@ -68,6 +83,22 @@ function connect(): void {
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.kind === "event" && ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(message.msg));
   if (message?.kind === "transport-query") sendResponse(ws?.readyState === WebSocket.OPEN);
+  if (message?.kind === "ask") {
+    const socket = ws;
+    if (socket?.readyState !== WebSocket.OPEN) {
+      sendResponse({ type: "response", id: 0, error: { message: "T3 Browser is not connected to T3 Code right now. Tell the agent in its chat.", code: "no_daemon" } });
+      return false;
+    }
+    const id = nextAsk++;
+    const timer = setTimeout(() => asks.get(id)?.({ type: "response", id, error: { message: "T3 Code did not answer in time.", code: "timeout" } }), ASK_TIMEOUT_MS);
+    asks.set(id, (res) => {
+      clearTimeout(timer);
+      asks.delete(id);
+      sendResponse(res);
+    });
+    socket.send(JSON.stringify({ ...(message.msg as RequestMessage), id }));
+    return true;
+  }
   return false;
 });
 

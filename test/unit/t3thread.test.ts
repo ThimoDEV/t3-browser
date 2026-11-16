@@ -1,10 +1,11 @@
 // Tab groups are named after the real T3 Code thread, and a settled or archived thread
 // releases its tabs. Both come from `t3 thread show <id> --json`.
-import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { parseThreadJson, readThread } from "../../src/t3thread";
+import { localT3Cli, parseThreadJson, readThread, sendToThread } from "../../src/t3thread";
+import { fakeCli, recordingCli } from "./fake-cli";
 
 describe("parseThreadJson", () => {
   it("reads the title of a live thread", () => {
@@ -28,25 +29,6 @@ describe("parseThreadJson", () => {
     expect(parseThreadJson(JSON.stringify({ thread: { title: "" } }))).toEqual({ title: undefined, ended: false });
   });
 });
-
-/**
- * A stand-in for T3 Code's CLI running `body` (a Node script with `args` in scope). On Windows
- * it is a .cmd launcher, like the real `t3.cmd`.
- */
-function fakeCli(body: string): string {
-  const dir = mkdtempSync(join(tmpdir(), "t3b-cli-"));
-  const script = join(dir, "fake.mjs");
-  writeFileSync(script, `const args = process.argv.slice(2);\n${body}`);
-  if (process.platform === "win32") {
-    const cmd = join(dir, "t3.cmd");
-    writeFileSync(cmd, `@"${process.execPath}" "${script}" %*\r\n`);
-    return cmd;
-  }
-  const sh = join(dir, "t3");
-  writeFileSync(sh, `#!/bin/sh\nexec "${process.execPath}" "${script}" "$@"\n`);
-  chmodSync(sh, 0o755);
-  return sh;
-}
 
 describe("readThread", () => {
   it("runs `t3 thread show <id> --json` and reads the title", async () => {
@@ -94,5 +76,40 @@ describe("readThread", () => {
     };
     for (let i = 0; i < 40 && alive(); i++) await new Promise((r) => setTimeout(r, 50));
     expect(alive(), `CLI process ${pid} is still running`).toBe(false);
+  });
+});
+
+describe("sendToThread", () => {
+  const outFile = () => join(mkdtempSync(join(tmpdir(), "t3b-send-")), "seen.json");
+
+  it("posts the message through stdin to `t3 thread send <id> -`, untouched by any shell", async () => {
+    const out = outFile();
+    // Quotes, shell operators, % and newlines: all of them must arrive as typed.
+    const message = 'Logged in "as me" & ready | 100% ^done <ok>\n\nNext: the second account.';
+    expect(await sendToThread(recordingCli(out), "mcp:abc-123", message)).toEqual({ ok: true });
+    expect(JSON.parse(readFileSync(out, "utf8"))).toEqual({ args: ["thread", "send", "mcp:abc-123", "-"], stdin: message });
+  });
+
+  it("passes on what the CLI said when it fails", async () => {
+    const cli = recordingCli(outFile(), 1, "Error: something\nThread mcp:gone is no longer available.\n");
+    expect(await sendToThread(cli, "mcp:gone", "hi")).toEqual({ ok: false, error: "Thread mcp:gone is no longer available." });
+  });
+
+  it("never runs the CLI for an unexpected thread id", async () => {
+    const out = outFile();
+    expect(await sendToThread(recordingCli(out), 'x" & calc & "', "hi")).toMatchObject({ ok: false });
+    expect(existsSync(out)).toBe(false);
+  });
+
+  it("gives up on a CLI that hangs", async () => {
+    const started = Date.now();
+    expect(await sendToThread(fakeCli("setTimeout(() => {}, 30_000);"), "abc", "hi", 1_000)).toEqual({ ok: false, error: "T3 Code did not answer in time." });
+    expect(Date.now() - started).toBeLessThan(5_000);
+  });
+});
+
+describe("localT3Cli", () => {
+  it("uses the CLI T3 Code points agents at", () => {
+    expect(localT3Cli({ T3CODE_CLI_PATH: "/opt/t3/bin/t3" })).toBe("/opt/t3/bin/t3");
   });
 });

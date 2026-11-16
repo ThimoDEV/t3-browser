@@ -26,6 +26,12 @@ export interface Session {
   tabIds: number[];
   /** Set by Esc / Stop; reported to the agent once, then cleared. */
   interrupted?: string;
+  /**
+   * The user has this tab: they pressed Esc or Stop on it, or the agent handed it over for a
+   * step only they can do (`ask`). The page offers Hand back until they use it, dismiss it,
+   * or the agent acts in the tab again.
+   */
+  handback?: { tabId: number; ask?: string };
   createdAt: number;
 }
 
@@ -270,6 +276,7 @@ export async function removeTab(tabId: number): Promise<Session | undefined> {
     const i = s.tabIds.indexOf(tabId);
     if (i >= 0) {
       s.tabIds.splice(i, 1);
+      if (s.handback?.tabId === tabId) s.handback = undefined;
       await unmarkTab(tabId);
       await save();
       return s;
@@ -297,6 +304,25 @@ export async function takeInterrupt(s: Session): Promise<void> {
     `The user took back control of the browser (${why}). Stop and ask the user how to continue before using the browser again.`,
     "interrupted",
   );
+}
+
+/** The user has `tabId` now (see Session.handback). */
+export async function setHandback(s: Session, tabId: number, ask?: string): Promise<void> {
+  s.handback = { tabId, ...(ask ? { ask } : {}) };
+  await save();
+}
+
+export async function clearHandback(s: Session): Promise<void> {
+  if (!s.handback) return;
+  s.handback = undefined;
+  await save();
+}
+
+/** The user handed the tab back: the agent may carry on, without being told it was stopped. */
+export async function handedBack(s: Session): Promise<void> {
+  s.handback = undefined;
+  s.interrupted = undefined;
+  await save();
 }
 
 export async function markInterrupted(s: Session, reason: string): Promise<void> {

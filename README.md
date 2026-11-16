@@ -4,6 +4,7 @@ Let [T3 Code](https://github.com/pingdotgg/t3code) agents use your browser.
 
 ## What's new
 
+- **Hand back, with a note.** When you take a tab over (Esc or Stop), or an agent hands it to you to log in, the tab shows a small card: write a note, press **Hand back**, and the note arrives in the agent's T3 Code thread as a new message. No switching to T3 Code to say "done". The card also links to the thread.
 - **No permission prompts.** With the extension installed and connected, agents just open pages, see your web tabs, take one over and upload files. You watch it happen in the tab and press **Esc** to take over.
 - **Tabs land in the thread's tab group.** New tabs open in the background, right inside a group named after the thread, created on demand.
 - **Web pages only.** http and https, localhost included. Browser pages, extension pages, local files and the Chrome Web Store are refused with a clear `[restricted]` error.
@@ -11,7 +12,7 @@ Let [T3 Code](https://github.com/pingdotgg/t3code) agents use your browser.
 - **No silent hangs.** Opening a tab can no longer wait on an unseen prompt until the bridge times out.
 - **Self-updating extension.** `pnpm reload` builds and makes the connected Chrome load the new extension, no trip to `chrome://extensions`.
 - **Agents on other machines.** An agent on a VPS or a linked T3 Code environment can use the Chrome on your desk, over Tailscale or an SSH tunnel. See [Use it from another machine](#use-it-from-another-machine).
-- **A control page for your phone.** What each thread is doing in Chrome, a peek at its tabs, and Stop. See [Control page](#control-page).
+- **A control page for your phone.** What each thread is doing in Chrome, a peek at its tabs, Stop, and Hand back. See [Control page](#control-page).
 - **Quiet when idle.** Chrome's "started debugging this browser" bar goes away once an agent has been idle for a minute, and comes back when it acts again.
 
 It works like the Codex Chrome extension, for every agent T3 Code runs (Claude Code, Codex, Cursor):
@@ -24,6 +25,7 @@ It works like the Codex Chrome extension, for every agent T3 Code runs (Claude C
 - **Groups follow the thread.** The tab group carries the T3 Code thread's real title (read through T3 Code's `t3` CLI). When you settle or archive the thread, or its agent goes away for two minutes, its tabs are handed back: they stay open in a collapsed group, with the debugger and overlay gone. The extension popup and the "T3 Code is using this tab" pill on the page link straight to the thread.
 - **You see what it does.** When you watch a controlled tab, the agent's own cursor (a purple arrow tagged "T3 Code") glides to each element and shows the click or "Typing…" before the real input is sent. In background tabs it skips the animation, so nothing slows down.
 - **You stay in charge.** Pressing **Esc** on a controlled tab, or clicking **Stop**, hands control straight back, and the agent is told to stop and ask you.
+- **Hand the tab back from the page.** After Esc or Stop, the tab shows a "Your turn" card with a note box, **Hand back** and a link to the thread. Hand back posts your note to the agent's T3 Code thread as a new message (through T3 Code's `t3 thread send`), and the agent carries on. Agents use the same card for steps only you can do: `browser_hand_over` lets go of the tab and shows what they need ("Log in to GitHub, then hand the tab back"), so passwords never go through the chat. Answering in chat instead works too: the card goes away as soon as the agent acts in the tab.
 - **Plus a clean browser.** For public pages and local dev servers, agents can use an isolated Chrome driven by Vercel's [agent-browser](https://github.com/vercel-labs/agent-browser). It has no cookies.
 - **agent-browser on your real tabs.** The bridge exposes a CDP endpoint scoped to the thread's tab group, so `agent-browser connect` (or Playwright) can drive your signed-in tabs, with the same limits.
 
@@ -79,7 +81,7 @@ Start a **new** thread in T3 Code (MCP servers load when a session starts) and a
 
 ## Control page
 
-`node dist/cli.js control` prints a link (it carries the daemon's token once, then a cookie takes over). The page lists every thread that used Chrome since the daemon started: its tabs, its recent actions ("opened https://…", "typed 12 characters", never the text itself or URL query strings), a **Peek** button that screenshots a tab, and **Stop** (per thread, or all). Stop works like pressing Esc: the agent is told to stop and ask you.
+`node dist/cli.js control` prints a link (it carries the daemon's token once, then a cookie takes over). The page lists every thread that used Chrome since the daemon started: its tabs, its recent actions ("opened https://…", "typed 12 characters", never the text itself or URL query strings), a **Peek** button that screenshots a tab, and **Stop** (per thread, or all). Stop works like pressing Esc: the agent is told to stop and ask you. When a thread is waiting on you (you pressed Esc, or the agent handed you a tab), it shows what the agent asked for, a note box and **Hand back**, the same as the card on the page.
 
 To open it on your phone, let the daemon listen on your Tailscale address (next section) and open the printed `http://100.x.y.z:47823/control?token=…` link on the phone.
 
@@ -120,6 +122,7 @@ The daemon keeps running while remote use is set up (a remote agent cannot start
 | `browser_read` / `browser_screenshot` / `browser_eval` / `browser_wait` | Read text (paged), capture (works for background tabs too), evaluate JS, wait for text/selector/URL/load |
 | `browser_upload` / `browser_dialog` | File inputs, `alert`/`confirm`/`prompt` |
 | `browser_navigate` / `browser_close_tab` / `browser_name_session` / `browser_done` | Navigation, cleanup, naming the tab group, handing back control |
+| `browser_hand_over` | Give the user a tab for a step only they can do (log in, 2FA, CAPTCHA); their Hand back note arrives in the thread as a new message |
 | `browser_cdp_url` | CDP endpoint for `agent-browser connect` on the user's tabs |
 | `browser_status` | Is the extension connected, which tabs are mine |
 
@@ -164,3 +167,4 @@ Environment: `T3_BROWSER_PORT` (default 47823, change the extension's port in it
 - Cross-process (out-of-process) iframes don't show up in `browser_snapshot` yet. Use `browser_cdp_url` with agent-browser for those pages.
 - Chrome shows its own "T3 Browser started debugging this browser" bar while an agent is attached. Clicking **Cancel** on it also stops the agent.
 - The extension isn't on the Web Store yet, so it is loaded unpacked.
+- Hand back posts through the `t3` command on the machine with Chrome, so it reaches threads that T3 Code on that machine knows. An agent running on another machine may not be one of them; the card then says the note could not be sent, and you tell the agent in its chat.

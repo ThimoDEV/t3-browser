@@ -69,6 +69,10 @@ export function describeCall(method: string, p: Record<string, unknown> = {}): s
       return "finished and handed the tabs back";
     case "session.stop":
       return "stopped from the control page";
+    case "session.handover":
+      return "handed you a tab";
+    case "thread.send":
+      return "you handed the tab back";
     case "cdp.send":
       return `agent-browser: ${String(p.method ?? "")}`;
     default:
@@ -161,7 +165,8 @@ ul{list-style:none;margin:8px 0 0;padding:0;display:grid;gap:4px}li{font-size:13
 li .t{flex:none;width:36px;font-variant-numeric:tabular-nums}li.err{color:var(--danger)}.tab{color:var(--fg)}.tab span{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 button{font:inherit;font-size:13px;font-weight:600;border-radius:8px;padding:6px 12px;border:1px solid var(--line);background:var(--bg);color:var(--fg);cursor:pointer}
 button.danger{background:var(--danger);border-color:var(--danger);color:#fff}button.small{padding:2px 8px;font-size:12px}
-.muted{color:var(--muted)}dialog{max-width:96vw;border:1px solid var(--line);border-radius:12px;background:var(--bg);color:var(--fg)}dialog img{max-width:100%;display:block;margin-bottom:8px}`;
+.turn{margin:8px 0 0;padding:8px 10px;border:1px solid var(--accent);border-radius:10px}.turn p{margin:0 0 6px;font-size:14px}.turn input{flex:1;min-width:0;font:inherit;font-size:14px;padding:6px 8px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--fg)}
+button.accent{background:var(--accent);border-color:var(--accent);color:#fff}.muted{color:var(--muted)}dialog{max-width:96vw;border:1px solid var(--line);border-radius:12px;background:var(--bg);color:var(--fg)}dialog img{max-width:100%;display:block;margin-bottom:8px}`;
 
 export const CONTROL_JS = `(() => {
   const $ = (s) => document.querySelector(s);
@@ -191,6 +196,8 @@ export const CONTROL_JS = `(() => {
   }
 
   async function render() {
+    const typing = document.activeElement && document.activeElement.matches("section.thread input");
+    if (typing) return;
     let state;
     try { state = await (await fetch("/control/state")).json(); } catch { $("#conn").textContent = "daemon unreachable"; $("#conn").className = "status"; return; }
     if (state.error) { location.reload(); return; }
@@ -213,11 +220,28 @@ export const CONTROL_JS = `(() => {
         const b = el("button", { class: "small" }, "Peek"); b.onclick = () => peek(t.id, tab.tabId);
         tabs.append(el("li", { class: "tab" }, el("span", { title: tab.url }, tab.title || tab.url), b));
       }
+      // The user has the tab (pressed Esc, or the agent asked for a step only they can do).
+      let turn = "";
+      if (t.yourTurn) {
+        const note = el("input", { type: "text", placeholder: "Note for the agent (optional)", maxlength: "2000", "aria-label": "Note for the agent" });
+        const give = el("button", { class: "small accent" }, "Hand back");
+        const send = async () => {
+          give.disabled = true;
+          const r = await post("/control/handback", { session: t.id, note: note.value }).catch(() => UNREACHABLE);
+          if (r.error) alert(r.error);
+          render();
+        };
+        give.onclick = send;
+        note.onkeydown = (e) => { if (e.key === "Enter") send(); };
+        turn = el("div", { class: "turn" },
+          el("p", {}, el("strong", {}, "Your turn. "), t.yourTurn.ask || "You have the tab."),
+          t.canHandBack ? el("div", { class: "row" }, note, give) : el("p", { class: "muted" }, "Tell the agent in its chat when you are done."));
+      }
       const acts = el("ul");
       for (const a of t.activity.slice(0, 12)) acts.append(el("li", { class: a.ok ? "" : "err" }, el("span", { class: "t" }, ago(a.at)), el("span", {}, a.text + (a.ok ? "" : " (failed)"))));
       main.append(el("section", { class: "thread" },
         el("div", { class: "row" }, el("h2", {}, title), el("span", { class: "pill" + (t.connected ? " on" : "") }, t.connected ? "agent connected" : "agent gone"), stop),
-        tabs, acts));
+        turn, tabs, acts));
     }
   }
 

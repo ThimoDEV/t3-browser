@@ -20,6 +20,7 @@ process.env.T3_BROWSER_RELEASE_AFTER_MS = String(GRACE_MS);
 process.env.T3_BROWSER_LISTEN = "127.0.0.2,8.8.8.8";
 
 const { Daemon } = await import("../../src/daemon");
+const { recordingCli } = await import("./fake-cli");
 const { EXTENSION_ID } = await import("../../src/protocol");
 
 let daemon: InstanceType<typeof Daemon>;
@@ -311,13 +312,13 @@ describe("control page", () => {
   }
 
   /** An extension that owns one tab for every thread and records what it is asked. */
-  async function fakeExtensionWithTab() {
+  async function fakeExtensionWithTab(session: Record<string, unknown> = {}) {
     const ext = await connect("/extension", { origin: `chrome-extension://${EXTENSION_ID}` });
     ext.send(JSON.stringify({ type: "hello", role: "extension", protocol: 1, version: "test" }));
     ext.on("message", (raw) => {
       const m = JSON.parse(raw.toString());
       if (m.type !== "request") return;
-      const result = m.method === "status" ? { tabs: [{ tabId: 5, title: "Inbox", url: "https://mail.example/inbox?auth=SECRET" }] } : { ok: true };
+      const result = m.method === "status" ? { session, tabs: [{ tabId: 5, title: "Inbox", url: "https://mail.example/inbox?auth=SECRET" }] } : { ok: true };
       ext.send(JSON.stringify({ type: "response", id: m.id, result }));
     });
     return ext;
@@ -398,6 +399,111 @@ describe("control page", () => {
     expect(await stopped).toBeDefined();
     client.close();
     ext.close();
+  });
+});
+
+describe("control page: hand back", () => {
+  function http(path: string, opts: { method?: string; headers?: Record<string, string>; body?: string } = {}) {
+    return new Promise<{ status: number; body: string }>((resolve, reject) => {
+      const req = request({ host: "127.0.0.1", port: PORT, path, method: opts.method ?? "GET", headers: opts.headers }, (res) => {
+        let body = "";
+        res.on("data", (d) => (body += d));
+        res.on("end", () => resolve({ status: res.statusCode ?? 0, body }));
+      });
+      req.on("error", reject);
+      req.end(opts.body);
+    });
+  }
+
+  it("shows a thread waiting on the user, and hands its tab back with the note", async () => {
+    const ext = await connect("/extension", { origin: `chrome-extension://${EXTENSION_ID}` });
+    ext.send(JSON.stringify({ type: "hello", role: "extension", protocol: 1, version: "test" }));
+    ext.on("message", (raw) => {
+      const m = JSON.parse(raw.toString());
+      if (m.type !== "request") return;
+      const result =
+        m.method === "status"
+          ? { session: { handback: m.session.id === "ctl-hb" ? { tabId: 5, ask: "Log in, then hand the tab back." } : null }, tabs: [{ tabId: 5, title: "Login", url: "https://x.example/login" }] }
+          : { sent: true };
+      ext.send(JSON.stringify({ type: "response", id: m.id, result }));
+    });
+    const client = await connect("/client", { authorization: `Bearer ${daemon.token}` });
+    const opened = next(client);
+    client.send(JSON.stringify({ type: "request", id: 1, session: { id: "ctl-hb", title: "Log in", link: "https://app.t3.codes/threads/p/ctl-hb" }, method: "tabs.open", params: { url: "https://x.example/login" } }));
+    await opened;
+    const cookie = await new Promise<string>((resolve) => {
+      request({ host: "127.0.0.1", port: PORT, path: `/control?token=${daemon.token}` }, (res) => resolve(String(res.headers["set-cookie"]).split(";")[0])).end();
+    });
+
+    const state = JSON.parse((await http("/control/state", { headers: { cookie } })).body);
+    const thread = state.threads.find((t: { id: string }) => t.id === "ctl-hb");
+    expect(thread).toMatchObject({ yourTurn: { ask: "Log in, then hand the tab back." }, canHandBack: true });
+
+    const body = JSON.stringify({ session: "ctl-hb", note: "Done, logged in." });
+    expect((await http("/control/handback", { method: "POST", headers: { cookie }, body })).status).toBe(403);
+    const asked = waitFor(ext, (m) => m.method === "session.handback" && m.session.id === "ctl-hb");
+    const res = await http("/control/handback", { method: "POST", headers: { cookie, "x-t3-browser": "1", origin: `http://127.0.0.1:${PORT}`, host: `127.0.0.1:${PORT}` }, body });
+    expect(JSON.parse(res.body)).toEqual({ sent: true });
+    expect((await asked).params).toEqual({ note: "Done, logged in." });
+    client.close();
+    await closeAndWait(ext);
+  });
+});
+
+describe("hand back", () => {
+  const LINK = "https://app.t3.codes/threads/p/mcp%3Ahb-1";
+  const sentFile = () => join(mkdtempSync(join(process.env.T3_BROWSER_HOME!, "sent-")), "sent.json");
+
+  async function extension() {
+    const ext = await connect("/extension", { origin: `chrome-extension://${EXTENSION_ID}` });
+    ext.send(JSON.stringify({ type: "hello", role: "extension", protocol: 1, version: "test" }));
+    return ext;
+  }
+  /** The extension asks the daemon to post a note, as the page's Hand back does. */
+  async function ask(ext: WebSocket, id: number, session: Record<string, unknown>, message: string) {
+    const answer = waitFor(ext, (m) => m.type === "response" && m.id === id, 10_000);
+    ext.send(JSON.stringify({ type: "request", id, session, method: "thread.send", params: { message } }));
+    return answer;
+  }
+
+  it("posts the user's note to the thread with T3 Code's own CLI", async () => {
+    const out = sentFile();
+    process.env.T3CODE_CLI_PATH = recordingCli(out);
+    try {
+      const ext = await extension();
+      const note = '[T3 Browser] Handing tab 5 back to you.\n\nLogged in "as me" & 100% done';
+      expect(await ask(ext, 41, { id: "mcp:hb-1", title: "T", link: LINK }, note)).toEqual({ type: "response", id: 41, result: { sent: true } });
+      expect(JSON.parse(readFileSync(out, "utf8"))).toEqual({ args: ["thread", "send", "mcp:hb-1", "-"], stdin: note });
+      await closeAndWait(ext);
+    } finally {
+      delete process.env.T3CODE_CLI_PATH;
+    }
+  });
+
+  it("refuses a note for an agent outside T3 Code, without running anything", async () => {
+    const out = sentFile();
+    process.env.T3CODE_CLI_PATH = recordingCli(out);
+    try {
+      const ext = await extension();
+      const res = await ask(ext, 42, { id: "claude-session", title: "T" }, "hi");
+      expect(res.error).toMatchObject({ code: "not_t3" });
+      expect(existsSync(out)).toBe(false);
+      await closeAndWait(ext);
+    } finally {
+      delete process.env.T3CODE_CLI_PATH;
+    }
+  });
+
+  it("says what went wrong when T3 Code cannot take the note", async () => {
+    process.env.T3CODE_CLI_PATH = recordingCli(sentFile(), 1, "Thread mcp:hb-1 is no longer available.");
+    try {
+      const ext = await extension();
+      const res = await ask(ext, 43, { id: "mcp:hb-1", title: "T", link: LINK }, "hi");
+      expect(res.error).toEqual({ code: "send_failed", message: "Could not post to the thread: Thread mcp:hb-1 is no longer available." });
+      await closeAndWait(ext);
+    } finally {
+      delete process.env.T3CODE_CLI_PATH;
+    }
   });
 });
 

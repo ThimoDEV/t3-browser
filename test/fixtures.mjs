@@ -22,7 +22,8 @@ const pages = {
      <a href="/page2.html" target="_blank">Open page two in a new tab</a>
      <iframe src="/frame.html" title="Inner frame" width="300" height="80"></iframe>
      <div id="spacer"></div>
-     <button onclick="this.textContent='Bottom clicked'">Bottom button</button>`,
+     <button onclick="this.textContent='Bottom clicked'">Bottom button</button>
+     <script>window.pageKeys = ""; document.addEventListener("keydown", (e) => (window.pageKeys += e.key));</script>`,
   ),
   "/covered.html": page(
     "Covered",

@@ -33,7 +33,10 @@ export interface RpcError {
   code?: string;
 }
 
-/** Sent by the daemon to the extension, and by clients to the daemon. */
+/**
+ * Sent by the daemon to the extension, and by clients to the daemon. The extension also sends
+ * the daemon requests of its own (EXTENSION_ASKS), answered with a response carrying its id.
+ */
 export interface RequestMessage {
   type: "request";
   id: number;
@@ -100,6 +103,14 @@ export const EXTENSION_METHODS = [
   "extension.reload",
   "session.stop",
   "page.peek",
+  "session.handover",
+  "session.handback",
 ] as const;
+
+/**
+ * What the extension may ask the daemon. "thread.send": post the user's hand-back note to the
+ * thread in T3 Code (params: { message }; the request's session is the thread).
+ */
+export const EXTENSION_ASKS = ["thread.send"] as const;
 
 export type ExtensionMethod = (typeof EXTENSION_METHODS)[number];

@@ -152,25 +152,20 @@ let watcherOn = true;
 })();
 const assertNoPrompts = () => assert.deepEqual(extensionPagesSeen, [], "the extension must not open any prompt window");
 
-const env = {
-  ...process.env,
-  T3_BROWSER_HOME: join(tmp, "home"),
-  T3_BROWSER_PORT: String(PORT),
-  T3_BROWSER_SESSION_ID: "e2e-thread",
-  T3_BROWSER_SESSION_TITLE: "E2E",
-  AGENT_BROWSER_EXECUTABLE_PATH: exe,
-  // Threads that go away are released quickly in this test.
-  T3_BROWSER_RELEASE_AFTER_MS: "1500",
-};
-
-/** A stand-in for T3 Code's `t3` CLI: one thread, settled once the flag file exists. */
+/**
+ * A stand-in for T3 Code's `t3` CLI: one thread, settled once the flag file exists. Messages
+ * posted with `t3 thread send` are appended to sentFile, one JSON line each.
+ */
 const settledFlag = join(tmp, "thread-settled");
+const sentFile = join(tmp, "thread-sent.jsonl");
 function fakeT3Cli() {
   const script = join(tmp, "fake-t3.mjs");
   writeFileSync(
     script,
-    `import { existsSync } from "node:fs";
-     process.stdout.write(JSON.stringify({ thread: { title: "Plan the team offsite", link: "https://app.t3.codes/threads/e2e-offsite", settled: existsSync(${JSON.stringify(settledFlag)}), archived: false } }));`,
+    `import { appendFileSync, existsSync, readFileSync } from "node:fs";
+     const args = process.argv.slice(2);
+     if (args[1] === "send") appendFileSync(${JSON.stringify(sentFile)}, JSON.stringify({ args, stdin: readFileSync(0, "utf8") }) + "\\n");
+     else process.stdout.write(JSON.stringify({ thread: { title: "Plan the team offsite", link: "https://app.t3.codes/threads/e2e-offsite", settled: existsSync(${JSON.stringify(settledFlag)}), archived: false } }));`,
   );
   if (process.platform === "win32") {
     const cmd = join(tmp, "t3.cmd");
@@ -182,6 +177,22 @@ function fakeT3Cli() {
   chmodSync(sh, 0o755);
   return sh;
 }
+const t3Cli = fakeT3Cli();
+const sentToThread = () => (existsSync(sentFile) ? readFileSync(sentFile, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l)) : []);
+
+const env = {
+  ...process.env,
+  // The daemon posts hand-back notes with this CLI. Never the real one this test may run under.
+  T3CODE_CLI_PATH: t3Cli,
+  T3_BROWSER_HOME: join(tmp, "home"),
+  T3_BROWSER_PORT: String(PORT),
+  T3_BROWSER_SESSION_ID: "e2e-thread",
+  T3_BROWSER_SESSION_TITLE: "E2E",
+  AGENT_BROWSER_EXECUTABLE_PATH: exe,
+  // Threads that go away are released quickly in this test.
+  T3_BROWSER_RELEASE_AFTER_MS: "1500",
+};
+
 
 /** Another agent thread: its own MCP server process, as T3 Code would start it. */
 async function startAgent(extraEnv) {
@@ -240,9 +251,9 @@ const refOf = (snapshot, pattern) => {
 let tab;
 let snap;
 
-await step("lists 22 tools with instructions", async () => {
+await step("lists 23 tools with instructions", async () => {
   const { tools } = await mcp.listTools();
-  assert.equal(tools.length, 22, tools.map((t) => t.name).join(","));
+  assert.equal(tools.length, 23, tools.map((t) => t.name).join(","));
   assert.match(mcp.getInstructions() ?? "", /untrusted/);
 });
 
@@ -490,7 +501,7 @@ await step("the tab group is named after the T3 Code thread, and settling the th
   const agent = await startAgent({
     T3_BROWSER_SESSION_ID: "e2e-thread-2",
     T3CODE_THREAD_ID: "e2e-thread-2",
-    T3CODE_CLI_PATH: fakeT3Cli(),
+    T3CODE_CLI_PATH: t3Cli,
     T3_BROWSER_SESSION_TITLE: "",
     T3_BROWSER_THREAD_POLL_MS: "300",
   });
@@ -519,6 +530,94 @@ await step("the tab group is named after the T3 Code thread, and settling the th
     const attached = await inExtension(`chrome.debugger.getTargets().then(ts => ts.find(t => t.tabId === ${opened.tab})?.attached)`);
     assert.equal(attached, false, "the debugger is detached");
     await inExtension(`chrome.tabs.remove(${opened.tab})`);
+  } finally {
+    await agent.close().catch(() => {});
+  }
+});
+
+/** The Hand back card on a tab, read and used the way the overlay itself sees it (its shadow root is closed). */
+const card = {
+  text: (tabId) =>
+    inExtension(`chrome.scripting.executeScript({ target: { tabId: ${tabId} }, func: () => {
+      const host = document.querySelector("t3-browser-overlay");
+      const turn = host && chrome.dom.openOrClosedShadowRoot(host)?.querySelector(".turn");
+      return turn && !turn.classList.contains("hidden") ? turn.innerText : null;
+    } }).then((r) => r[0].result)`),
+  async waitFor(tabId, pattern) {
+    let text;
+    for (let i = 0; i < 40; i++) {
+      text = await card.text(tabId).catch(() => null);
+      if (text && pattern.test(text)) return text;
+      await sleep(150);
+    }
+    assert.fail(`no Hand back card matching ${pattern} on tab ${tabId}; saw ${JSON.stringify(text)}`);
+  },
+  /** Type keys into the note box (as composed events, like real typing), then submit. */
+  submit: (tabId, note) =>
+    inExtension(`chrome.scripting.executeScript({ target: { tabId: ${tabId} }, args: [${JSON.stringify(note)}], func: (note) => {
+      const root = chrome.dom.openOrClosedShadowRoot(document.querySelector("t3-browser-overlay"));
+      const input = root.querySelector(".note");
+      input.focus();
+      for (const key of ["s", "/"]) input.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true, composed: true }));
+      input.value = note;
+      root.querySelector(".send").requestSubmit();
+      return true;
+    } }).then((r) => r[0].result)`),
+};
+async function waitForSent(count) {
+  for (let i = 0; i < 60 && sentToThread().length < count; i++) await sleep(150);
+  const sent = sentToThread();
+  assert.equal(sent.length, count, `messages posted to the thread: ${JSON.stringify(sent)}`);
+  return sent[count - 1];
+}
+const pageTarget = async (urlEnd) => (await user.send("Target.getTargets")).targetInfos.find((t) => t.type === "page" && t.url.endsWith(urlEnd));
+
+await step("the user hands a tab back from the page, and the note reaches the agent's T3 Code thread", async () => {
+  const agent = await startAgent({ T3_BROWSER_SESSION_ID: "e2e-handback", T3CODE_THREAD_ID: "e2e-handback", T3CODE_CLI_PATH: t3Cli, T3_BROWSER_SESSION_TITLE: "" });
+  try {
+    const t = (await agent.call("browser_open", { url: `${site}/form.html?handback=1`, focus: true })).tab;
+    for (let i = 0; i < 25 && !(await agent.call("browser_status")).user.session.link; i++) await sleep(200);
+
+    // 1. The agent needs a login: it lets go of the tab and says what it needs.
+    const over = await agent.call("browser_hand_over", { tab: t, message: "Log in, then hand the tab back." });
+    assert.equal(over.canHandBack, true);
+    const shown = await card.waitFor(t, /Log in, then hand the tab back\./);
+    assert.match(shown, /Your turn/);
+    assert.match(shown, /Plan the team offsite/, "the card names the thread");
+    const attached = await inExtension(`chrome.debugger.getTargets().then(ts => ts.find(x => x.tabId === ${t})?.attached)`);
+    assert.equal(attached, false, "the agent let go of the tab");
+
+    // 2. The user hands it back with a note. Keys typed into the note never reach the page.
+    await card.submit(t, "Logged in. Use the second account.");
+    const first = await waitForSent(1);
+    assert.deepEqual(first.args, ["thread", "send", "e2e-handback", "-"]);
+    assert.equal(first.stdin, `[T3 Browser] Handing tab ${t} (\u201cSignup form\u201d at ${site}/form.html) back to you.\n\nLogged in. Use the second account.`);
+    const page = await pageTarget("/form.html?handback=1");
+    assert.equal(await user.evalIn(page.targetId, "window.pageKeys"), "", "the page saw keys typed into the note");
+    await card.waitFor(t, /Sent to T3 Code/);
+
+    // 3. The agent carries on in the tab: it is not told it was stopped.
+    await agent.call("browser_snapshot", { tab: t });
+
+    // 4. The user presses Esc, does something, and hands back without a note.
+    const { sessionId } = await user.send("Target.attachToTarget", { targetId: page.targetId, flatten: true });
+    for (const type of ["keyDown", "keyUp"]) await user.send("Input.dispatchKeyEvent", { type, key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 }, sessionId);
+    await user.send("Target.detachFromTarget", { sessionId });
+    await card.waitFor(t, /You have the tab/);
+    await card.submit(t, "");
+    const second = await waitForSent(2);
+    assert.ok(second.stdin.endsWith("back to you. Carry on where you left off."), second.stdin);
+    await agent.call("browser_snapshot", { tab: t });
+
+    // 5. Answering in chat works too: when the agent acts in the tab, the card goes away.
+    await agent.call("browser_hand_over", { tab: t, message: "Pick a plan." });
+    await card.waitFor(t, /Pick a plan\./);
+    await agent.call("browser_snapshot", { tab: t });
+    for (let i = 0; i < 20 && (await card.text(t)); i++) await sleep(150);
+    assert.equal(await card.text(t), null, "the card is gone once the agent acts");
+    assert.equal((await agent.call("browser_status")).user.session.handback, null, "the thread no longer waits on the user");
+    assert.equal(sentToThread().length, 2, "nothing was posted for a card the agent took back");
+    await agent.call("browser_close_tab", { tab: t });
   } finally {
     await agent.close().catch(() => {});
   }

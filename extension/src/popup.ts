@@ -57,7 +57,7 @@ async function render() {
       el(
         "li",
         { class: "session" },
-        el("div", { class: "row-head" }, chip, el("strong", {}, s.title), el("span", { class: `pill ${acting ? "on" : ""}` }, s.interrupted ? "stopped" : acting ? "in control" : live ? "idle" : "no tabs"), show, open, stop),
+        el("div", { class: "row-head" }, chip, el("strong", {}, s.title), el("span", { class: `pill ${acting ? "on" : ""}` }, s.handback ? "your turn" : s.interrupted ? "stopped" : acting ? "in control" : live ? "idle" : "no tabs"), show, open, stop),
         tabs,
       ),
     );

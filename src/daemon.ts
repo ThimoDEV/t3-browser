@@ -26,6 +26,7 @@ import {
   type SessionInfo,
   type WireMessage,
 } from "./protocol.js";
+import { localT3Cli, sendToThread } from "./t3thread.js";
 import { VERSION } from "./version.js";
 
 const EXTENSION_WAIT_MS = 20_000;
@@ -288,10 +289,10 @@ export class Daemon {
     if (req.method === "GET" && url.pathname === "/control") return send(200, "text/html; charset=utf-8", CONTROL_HTML);
     if (req.method === "GET" && url.pathname === "/control/state") return json(200, await this.controlState());
 
-    if (req.method === "POST" && (url.pathname === "/control/stop" || url.pathname === "/control/peek")) {
+    if (req.method === "POST" && (url.pathname === "/control/stop" || url.pathname === "/control/peek" || url.pathname === "/control/handback")) {
       const origin = req.headers.origin;
       if (req.headers["x-t3-browser"] !== "1" || (origin && origin !== `http://${req.headers.host}`)) return json(403, { error: "forbidden" });
-      const body = (await readJson(req)) as { session?: string; tabId?: number };
+      const body = (await readJson(req)) as { session?: string; tabId?: number; note?: string };
       if (url.pathname === "/control/stop") {
         // Without Chrome nothing can be stopped: say so at once instead of waiting for it per thread.
         if (this.extension?.readyState !== WebSocket.OPEN) {
@@ -312,6 +313,11 @@ export class Daemon {
       }
       const info = body.session ? this.activeSessions.get(body.session) : undefined;
       if (!info) return json(404, { error: "That thread has no tabs any more." });
+      if (url.pathname === "/control/handback") {
+        // The extension posts the note (thread.send above), so the page and the phone take one path.
+        const r = await this.forward(info, "session.handback", { note: String(body.note ?? "").slice(0, 2_000) });
+        return r.error ? json(200, { error: r.error.message }) : json(200, r.result);
+      }
       const r = await this.forward(info, "page.peek", { tabId: Number(body.tabId) });
       return r.error ? json(200, { error: r.error.message }) : json(200, r.result);
     }
@@ -328,13 +334,16 @@ export class Daemon {
     for (const [id, { info, activity }] of threads) {
       const current = this.activeSessions.get(id) ?? info;
       let tabs: Array<{ tabId: number; title: string; url: string }> = [];
+      let yourTurn: { ask?: string } | undefined;
       if (this.activeSessions.has(id) && extensionConnected) {
         const r = await this.forward(current, "status", {});
-        const list = ((r.result as { tabs?: Array<{ tabId: number; title: string; url: string }> })?.tabs ?? []);
-        tabs = list.map((t) => ({ tabId: t.tabId, title: t.title, url: String(t.url).split(/[?#]/)[0] }));
+        const st = r.result as { tabs?: Array<{ tabId: number; title: string; url: string }>; session?: { handback?: { ask?: string } } } | undefined;
+        tabs = (st?.tabs ?? []).map((t) => ({ tabId: t.tabId, title: t.title, url: String(t.url).split(/[?#]/)[0] }));
+        // The user has one of the thread's tabs and may hand it back (with a note) from here.
+        if (st?.session?.handback) yourTurn = st.session.handback.ask ? { ask: String(st.session.handback.ask) } : {};
       }
       const link = current.link && /^https?:\/\//.test(current.link) ? current.link : undefined;
-      out.push({ id, title: current.title === id ? "agent-browser" : current.title, link, connected: live.has(id), controlling: tabs.length > 0, tabs, activity });
+      out.push({ id, title: current.title === id ? "agent-browser" : current.title, link, connected: live.has(id), controlling: tabs.length > 0, tabs, activity, ...(yourTurn ? { yourTurn, canHandBack: !!link } : {}) });
     }
     return { extensionConnected, threads: out };
   }
@@ -416,6 +425,8 @@ export class Daemon {
         }
       } else if (msg.type === "event") {
         this.onExtensionEvent(msg);
+      } else if (msg.type === "request") {
+        void this.onExtensionRequest(msg).then((res) => ws.readyState === WebSocket.OPEN && ws.send(JSON.stringify(res)));
       } else if (msg.type === "ping") {
         ws.send(JSON.stringify({ type: "pong" }));
       }
@@ -436,6 +447,28 @@ export class Daemon {
 
   private onExtensionEvent(msg: EventMessage): void {
     for (const relay of this.relays) relay.onEvent(msg);
+  }
+
+  /** The extension asks something of the daemon (see EXTENSION_ASKS). */
+  private async onExtensionRequest(msg: RequestMessage): Promise<ResponseMessage> {
+    const fail = (message: string, code: string): ResponseMessage => ({ type: "response", id: msg.id, error: { message, code } });
+    if (msg.method !== "thread.send") return fail(`Unknown request ${msg.method}`, "unknown_method");
+    const id = typeof msg.session?.id === "string" ? msg.session.id : "";
+    const info = this.activeSessions.get(id) ?? msg.session;
+    const message = String(msg.params?.message ?? "").slice(0, 4_000);
+    // Only threads the MCP server found in T3 Code have a link; anything else has no thread to post to.
+    if (!info?.link) return fail("This agent is not running in a T3 Code thread, so the note cannot be sent there. Tell the agent in its chat.", "not_t3");
+    // Never a path from a client or the extension: only T3 Code's own CLI on this machine.
+    const cli = localT3Cli();
+    if (!cli) return fail("T3 Code's `t3` command was not found on this computer. Tell the agent in its chat.", "no_t3");
+    const started = Date.now();
+    const r = await sendToThread(cli, id, message);
+    this.activity.record(info, "thread.send", {}, r.ok, Date.now() - started);
+    if (!r.ok) {
+      log("thread.send failed", { session: id, error: r.error });
+      return fail(`Could not post to the thread: ${r.error}`, "send_failed");
+    }
+    return { type: "response", id: msg.id, result: { sent: true } };
   }
 
   private async waitForExtension(): Promise<boolean> {

@@ -3,17 +3,34 @@
 
 import type { EventMessage, RequestMessage, ResponseMessage } from "../../src/protocol";
 import { detach, detachIdle, idleTabs, isAttached, onCdpEvent, onDetach, wasIdleDetached } from "./cdp";
-import { dispatch, forgetTab, hasDialog, hideOverlay, onDialog, onStopRequest, onTabNavigated, ownActivations, relayTabs, showOverlay, syncOverlay } from "./commands";
+import {
+  dispatch,
+  forgetTab,
+  handBack,
+  hasDialog,
+  hideOverlay,
+  onDaemonAsk,
+  onDialog,
+  onStopRequest,
+  onTabNavigated,
+  ownActivations,
+  relayTabs,
+  showOverlay,
+  showYourTurn,
+  syncOverlay,
+} from "./commands";
 import {
   ActionError,
   addTab,
   allSessions,
+  clearHandback,
   getSettings,
   markInterrupted,
   markTab,
   adoptGroupColor,
   removeTab,
   sessionForTab,
+  setHandback,
   takeInterrupt,
   updateSettings,
   type Session,
@@ -62,17 +79,33 @@ function postEvent(msg: EventMessage): void {
   chrome.runtime.sendMessage({ kind: "event", msg }).catch(() => {});
 }
 
-async function interruptSession(s: Session, reason: string): Promise<void> {
+/**
+ * The user takes the thread's tabs back. `onTab`: the tab they did it in (Esc or Stop on the
+ * page), which then offers Hand back, so they can return it with a note when they are done.
+ */
+async function interruptSession(s: Session, reason: string, onTab?: number): Promise<void> {
   await markInterrupted(s, reason);
+  const keep = onTab !== undefined && s.tabIds.includes(onTab) ? onTab : undefined;
   for (const tabId of s.tabIds) {
-    await hideOverlay(tabId);
+    // The tab the user is in swaps the agent's overlay for the Hand back card instead.
+    if (tabId !== keep) await hideOverlay(tabId);
     await detach(tabId);
     relayTabs.delete(tabId);
+  }
+  if (keep !== undefined) {
+    await setHandback(s, keep);
+    await showYourTurn(keep, s);
   }
   postEvent({ type: "event", sessionId: s.id, event: "interrupted", data: { reason } });
 }
 
 onStopRequest((s, reason) => interruptSession(s, reason));
+
+// The extension's own requests to the daemon go out over the offscreen document's socket.
+onDaemonAsk(async (session, method, params) => {
+  const res = await chrome.runtime.sendMessage({ kind: "ask", msg: { type: "request", id: 0, session, method, params } }).catch(() => undefined);
+  return res ?? { type: "response", id: 0, error: { message: "T3 Browser is not connected to T3 Code right now. Tell the agent in its chat.", code: "no_daemon" } };
+});
 
 // ---- Idle detach ---------------------------------------------------------------------------
 // Chrome shows "T3 Browser started debugging this browser" while any tab is attached. When the
@@ -145,7 +178,32 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     case "interrupt": {
       const tabId = sender.tab?.id;
       if (tabId === undefined) return false;
-      sessionForTab(tabId).then((s) => s && interruptSession(s, message.reason === "escape" ? "pressed Esc" : "clicked Stop"));
+      sessionForTab(tabId).then((s) => s && interruptSession(s, message.reason === "escape" ? "pressed Esc" : "clicked Stop", tabId));
+      return false;
+    }
+    case "handback": {
+      // The page's Hand back: only for the tab the user really has.
+      const tabId = sender.tab?.id;
+      if (tabId === undefined) return false;
+      void (async () => {
+        const s = await sessionForTab(tabId);
+        if (!s || s.handback?.tabId !== tabId) return sendResponse({ error: "The agent already has this tab back." });
+        try {
+          await handBack(s, String(message.note ?? ""));
+          sendResponse({ ok: true });
+        } catch (err) {
+          sendResponse({ error: String((err as Error).message ?? err) });
+        }
+      })();
+      return true;
+    }
+    case "handback-dismiss": {
+      const tabId = sender.tab?.id;
+      if (tabId === undefined) return false;
+      void sessionForTab(tabId).then(async (s) => {
+        if (s?.handback?.tabId === tabId) await clearHandback(s);
+        await hideOverlay(tabId);
+      });
       return false;
     }
     case "popup-state":
@@ -341,16 +399,23 @@ chrome.tabs.onUpdated.addListener(async (tabId, change) => {
     const owner = await sessionForTab(tabId);
     if (owner) await markTab(owner, tabId);
   }
-  // Also while idle-detached: the tab is still the agent's, so the pill and Esc stay.
-  if (change.status !== "complete" || !(isAttached(tabId) || wasIdleDetached(tabId))) return;
+  if (change.status !== "complete") return;
   const s = await sessionForTab(tabId);
-  if (s && !s.interrupted) await showOverlay(tabId, s);
+  if (!s) return;
+  // The user has the tab (logging in, say): the Hand back card follows them to each page.
+  if (s.handback?.tabId === tabId) return void (await showYourTurn(tabId, s));
+  // Also while idle-detached: the tab is still the agent's, so the pill and Esc stay.
+  if (!s.interrupted && (isAttached(tabId) || wasIdleDetached(tabId))) await showOverlay(tabId, s);
 });
 
 // The user recoloured a thread's group: badges follow at once, overlays on their next show.
 chrome.tabGroups.onUpdated.addListener(async (group) => {
   const s = await adoptGroupColor(group.id, group.color);
-  if (s) for (const tabId of s.tabIds) if (isAttached(tabId) || wasIdleDetached(tabId)) await showOverlay(tabId, s);
+  if (!s) return;
+  for (const tabId of s.tabIds) {
+    if (s.handback?.tabId === tabId) await showYourTurn(tabId, s);
+    else if (isAttached(tabId) || wasIdleDetached(tabId)) await showOverlay(tabId, s);
+  }
 });
 
 // ---- Lifecycle ---------------------------------------------------------------------------
