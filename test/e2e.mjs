@@ -855,12 +855,14 @@ await step("two tabs opened at once by a new thread end up in one group", async 
 });
 
 let userTab;
-await step("two threads screenshotting background tabs at once leave the user's own tab in front", async () => {
+await step("two threads screenshotting background tabs at once never take the user's tab away", async () => {
   // The user's own tab, in front, in the same window as the agents' tabs.
   userTab = await inExtension(`chrome.tabs.get(${tab}).then((t) => chrome.tabs.create({ url: "${site}/page2.html?users-own-tab", windowId: t.windowId, active: true })).then((t) => t.id)`);
   await sleep(300);
   assert.equal(await activeTabId(), userTab);
-  // Four at once, two per thread, so the tab switches really overlap.
+  // Every tab switch while the screenshots run: a background tab is captured where it is.
+  await inExtension(`(globalThis.__switches = [], globalThis.__onSwitch = (a) => globalThis.__switches.push(a.tabId), chrome.tabs.onActivated.addListener(globalThis.__onSwitch), true)`);
+  // Four at once, two per thread, so the captures really overlap.
   const shots = await Promise.all([
     call("browser_screenshot", { tab }),
     second.call("browser_screenshot", { tab: secondTab }),
@@ -869,7 +871,9 @@ await step("two threads screenshotting background tabs at once leave the user's 
   ]);
   assert.ok(shots[0].content.some((c) => c.type === "image") && shots[2].content.some((c) => c.type === "image"), "thread #1 got its screenshots");
   assert.ok(shots[1] && shots[3], "thread #2 got its screenshots");
-  assert.equal(await activeTabId(), userTab, "the user's tab is in front again");
+  assert.equal(await activeTabId(), userTab, "the user's tab is still in front");
+  const switches = await inExtension("(chrome.tabs.onActivated.removeListener(globalThis.__onSwitch), globalThis.__switches)");
+  assert.deepEqual(switches, [], "no tab was brought forward for a screenshot");
 });
 
 await step("the control page names every thread that Stop all could not stop", async () => {
@@ -943,11 +947,11 @@ await step("the user can switch to an agent's new tab on purpose, and the agent 
   await inExtension(`chrome.tabs.update(${popup.tab}, { active: true }).then(() => true)`);
   await sleep(400);
   assert.equal(await activeTabId(), popup.tab, "the user's own choice is not undone");
-  // Back to the user's tab; the agent screenshots the new tab, which briefly brings it forward.
+  // Back to the user's tab; the agent screenshots the new tab where it is, in the background.
   await inExtension(`chrome.tabs.update(${userTab}, { active: true }).then(() => true)`);
   const shot = await call("browser_screenshot", { tab: popup.tab });
   assert.ok(shot.content.some((c) => c.type === "image"), "the screenshot of the new tab worked");
-  assert.equal(await activeTabId(), userTab, "and the user's tab is back in front");
+  assert.equal(await activeTabId(), userTab, "and the user's tab stays in front");
   await call("browser_close_tab", { tab: popup.tab });
   await inExtension(`chrome.tabs.update(${userTab}, { active: true }).then(() => true)`);
   await second.call("browser_done", {});

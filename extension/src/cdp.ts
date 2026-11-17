@@ -60,8 +60,10 @@ chrome.debugger.onDetach.addListener((source, reason) => {
   for (const l of detachListeners) l(source.tabId, reason);
 });
 
-export function onCdpEvent(l: EventListener): void {
+/** Listen to CDP events of every attached tab; call the returned function to stop. */
+export function onCdpEvent(l: EventListener): () => void {
   eventListeners.add(l);
+  return () => eventListeners.delete(l);
 }
 
 export function onDetach(l: DetachListener): void {

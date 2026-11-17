@@ -2,7 +2,7 @@
 // thread's Session and validated-ish params, and returns JSON (screenshots as base64).
 
 import type { ResponseMessage, SessionInfo, TabInfo } from "../../src/protocol";
-import { attach, busyCount, detach, detachIdle, isAttached, markBusy, onDocumentReplaced, send } from "./cdp";
+import { attach, busyCount, detach, detachIdle, isAttached, markBusy, onCdpEvent, onDocumentReplaced, send } from "./cdp";
 import { parseKey } from "./keys";
 import {
   ActionError,
@@ -483,37 +483,129 @@ const oneAtATime = createQueue();
  */
 export const ownActivations = new Set<number>();
 
+type Settled<T> = { ok: true; value: T } | { ok: false; error: unknown };
+const settle = <T>(p: Promise<T>): Promise<Settled<T>> => p.then((value) => ({ ok: true as const, value }), (error) => ({ ok: false as const, error }));
+
+/** Hide or show the overlay's element through CDP: instant even in a hidden tab, unlike executeScript. */
+async function overlayElementHidden(tabId: number, hidden: boolean): Promise<void> {
+  const expression = `document.querySelectorAll("t3-browser-overlay").forEach((e) => ${hidden ? 'e.style.setProperty("visibility", "hidden", "important")' : 'e.style.removeProperty("visibility")'})`;
+  await send(tabId, "Runtime.evaluate", { expression }, undefined, 1_000).catch(() => {});
+}
+
+/**
+ * A screenshot of a background tab without bringing it to the front.
+ *
+ * Measured in Chrome 157 on Windows: Page.captureScreenshot alone on a hidden tab takes ~2s in
+ * Chrome stable and never answers while the window is minimized. With a screencast running on
+ * the tab, the same capture answers in ~90ms, minimized too, with the current page. The
+ * screencast's own frames are not used: they can show what the tab drew long ago (seen in the
+ * user's Chrome: a page from before the agent changed it, with the overlay still on it).
+ *
+ * Resolves `data` with the capture's answer if it comes in time; `done` once the screencast is
+ * cleaned up. Without an answer in time, `data` is undefined and `pending` is still in flight.
+ */
+async function captureHidden(
+  tabId: number,
+  params: Record<string, unknown>,
+): Promise<{ data?: string; pending: Promise<Settled<string>>; done: Promise<void> }> {
+  // A CDP client on the relay (agent-browser) may run its own screencast on this tab: ours would
+  // replace and then stop it, and its frames would reach that client. Plain capture there.
+  const useScreencast = !relayTabs.has(tabId);
+  // Frames must be acknowledged or Chrome stops sending them (and the screencast stops helping).
+  const stopListening = useScreencast
+    ? onCdpEvent((id, method, p: any, child) => {
+        if (id === tabId && !child && method === "Page.screencastFrame") {
+          void send(tabId, "Page.screencastFrameAck", { sessionId: p.sessionId }, undefined, 1_000).catch(() => {});
+        }
+      })
+    : () => {};
+  // Tiny frames: only the screencast running matters, not what it sends.
+  const casting = useScreencast
+    ? await send(tabId, "Page.startScreencast", { format: "jpeg", quality: 10, maxWidth: 64, maxHeight: 64, everyNthFrame: 1 }, undefined, 2_000)
+        .then(() => true)
+        .catch(() => false)
+    : false;
+  const pending = settle(send<{ data: string }>(tabId, "Page.captureScreenshot", params, undefined, 15_000).then((r) => r.data));
+
+  const first = await Promise.race([pending, sleep(2_000).then(() => undefined)]);
+  const data = first?.ok ? first.value : undefined;
+
+  // Keep the screencast until the capture answers (it may be what lets the capture finish),
+  // bounded: a capture Chrome never answers must not hold the screenshot queue for long.
+  const done = (async () => {
+    await Promise.race([pending, sleep(3_000)]);
+    stopListening();
+    if (casting) await send(tabId, "Page.stopScreencast", {}, undefined, 2_000).catch(() => {});
+  })();
+  return { data, pending, done };
+}
+
 async function captureEvenIfHidden(tabId: number, params: Record<string, unknown>): Promise<string> {
   // Everything goes through the queue, also a tab that is already in front: another thread's
-  // queued capture could otherwise switch it away mid-capture.
-  return oneAtATime(async () => {
-    if (await pageVisible(tabId)) return (await send<{ data: string }>(tabId, "Page.captureScreenshot", params, undefined, 15_000)).data;
-    const tab = await chrome.tabs.get(tabId);
-    const [previous] = await chrome.tabs.query({ active: true, windowId: tab.windowId });
-    ownActivations.add(tabId);
-    setTimeout(() => ownActivations.delete(tabId), 2_000);
-    await chrome.tabs.update(tabId, { active: true });
-    try {
-      // Bounded by the clock, not by attempts: a frozen page must not hold the queue for long.
-      let visible = false;
-      const until = Date.now() + 1_500;
-      while (!visible && Date.now() < until) {
-        await sleep(100);
-        visible = await pageVisible(tabId);
+  // queued capture could otherwise switch it away mid-capture. The caller gets the picture as
+  // soon as there is one; the queue moves on once the capture is cleaned up.
+  return new Promise<string>((resolve, reject) => {
+    void oneAtATime(async () => {
+      try {
+        if (await pageVisible(tabId)) return resolve((await send<{ data: string }>(tabId, "Page.captureScreenshot", params, undefined, 15_000)).data);
+        // In a background tab the overlay is updated lazily (see overlay()): hide it right now.
+        await overlayElementHidden(tabId, true);
+        let hidden: Awaited<ReturnType<typeof captureHidden>>;
+        try {
+          hidden = await captureHidden(tabId, params);
+        } finally {
+          await overlayElementHidden(tabId, false);
+        }
+        try {
+          resolve(hidden.data ?? (await captureByActivating(tabId, params, hidden.pending)));
+        } finally {
+          // Before the next capture: a late stopScreencast would end that one's screencast.
+          await hidden.done;
+        }
+      } catch (err) {
+        reject(err);
       }
-      if (!visible) {
-        throw new ActionError(
-          "Chrome is not drawing this tab (its window is minimized or covered), so it cannot be screenshotted right now. Use browser_snapshot or browser_read instead.",
-          "not_visible",
-        );
-      }
-      return (await send<{ data: string }>(tabId, "Page.captureScreenshot", params, undefined, 15_000)).data;
-    } finally {
-      // Hand the user's tab back, unless they moved on to another tab meanwhile.
-      const [now] = await chrome.tabs.query({ active: true, windowId: tab.windowId }).catch(() => []);
-      if (previous?.id !== undefined && previous.id !== tabId && now?.id === tabId) await chrome.tabs.update(previous.id, { active: true }).catch(() => {});
-    }
+    });
   });
+}
+
+/**
+ * Last resort: bring the tab to the front for the capture, then hand the user's tab back.
+ * `pending` is the capture already sent while the tab was hidden: showing the tab lets it finish.
+ */
+async function captureByActivating(tabId: number, params: Record<string, unknown>, pending: Promise<Settled<string>>): Promise<string> {
+  const tab = await chrome.tabs.get(tabId);
+  const [previous] = await chrome.tabs.query({ active: true, windowId: tab.windowId });
+  ownActivations.add(tabId);
+  setTimeout(() => ownActivations.delete(tabId), 2_000);
+  await chrome.tabs.update(tabId, { active: true });
+  try {
+    // Bounded by the clock, not by attempts: a frozen page must not hold the queue for long.
+    // The capture sent earlier may answer meanwhile; then that is the picture.
+    let answered: Settled<string> | undefined;
+    void pending.then((r) => (answered = r));
+    let visible = false;
+    const until = Date.now() + 1_500;
+    while (!visible && Date.now() < until) {
+      await sleep(100);
+      if (answered?.ok) return answered.value;
+      visible = await pageVisible(tabId);
+    }
+    if (answered?.ok) return answered.value;
+    if (!visible) {
+      throw new ActionError(
+        "Chrome is not drawing this tab (its window is minimized or covered), so it cannot be screenshotted right now. Use browser_snapshot or browser_read instead.",
+        "not_visible",
+      );
+    }
+    const first = await Promise.race([pending, sleep(3_000).then(() => undefined)]);
+    if (first?.ok) return first.value;
+    return (await send<{ data: string }>(tabId, "Page.captureScreenshot", params, undefined, 15_000)).data;
+  } finally {
+    // Hand the user's tab back, unless they moved on to another tab meanwhile.
+    const [now] = await chrome.tabs.query({ active: true, windowId: tab.windowId }).catch(() => []);
+    if (previous?.id !== undefined && previous.id !== tabId && now?.id === tabId) await chrome.tabs.update(previous.id, { active: true }).catch(() => {});
+  }
 }
 
 // ---------------------------------------------------------------------------------------
